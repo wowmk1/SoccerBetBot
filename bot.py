@@ -33,19 +33,72 @@ else:
 # ==== FOOTBALL API ====
 BASE_URL = "https://api.football-data.org/v4/competitions/"
 HEADERS = {"X-Auth-Token": FOOTBALL_DATA_API_KEY}
-COMPETITIONS = ["PL", "CL", "BL1", "DED", "PD", "FL1", "ELC", "PPL", "SA", "EC", "WC"]
+
+# Only include desired leagues
+COMPETITIONS = ["PL", "CL", "BL1", "PD", "FL1", "SA", "EC", "WC"]  # Excluded DED, ELC, PPL
 
 # ==== SAVE LEADERBOARD ====
 def save_leaderboard():
     with open(LEADERBOARD_FILE, "w") as f:
         json.dump(leaderboard, f)
 
+# ==== GENERATE MATCH IMAGE WITH CRESTS AND VOTERS ====
+async def generate_match_image(home_url, away_url, match_id):
+    async with aiohttp.ClientSession() as session:
+        home_img_bytes, away_img_bytes = None, None
+        try:
+            async with session.get(home_url) as r:
+                home_img_bytes = await r.read()
+        except: pass
+        try:
+            async with session.get(away_url) as r:
+                away_img_bytes = await r.read()
+        except: pass
+
+    size = (100, 100)
+    padding = 10
+    avatar_size = 30
+
+    # Base image for match crests
+    img_width = size[0]*2 + 40
+    img_height = size[1] + avatar_size + padding*2
+    img = Image.new("RGBA", (img_width, img_height), (255, 255, 255, 0))
+
+    # Draw home and away crests
+    if home_img_bytes:
+        home = Image.open(BytesIO(home_img_bytes)).convert("RGBA").resize(size)
+        img.paste(home, (0, 0), home)
+    if away_img_bytes:
+        away = Image.open(BytesIO(away_img_bytes)).convert("RGBA").resize(size)
+        img.paste(away, (size[0]+40, 0), away)
+
+    # Draw voter avatars below
+    voter_urls = [v["avatar"] for uid, v in leaderboard.items() if str(match_id) in v.get("predictions", {})]
+    x = 0
+    y = size[1] + padding
+    for i, url in enumerate(voter_urls):
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url) as r:
+                    avatar_bytes = await r.read()
+            avatar = Image.open(BytesIO(avatar_bytes)).convert("RGBA").resize((avatar_size, avatar_size))
+            img.paste(avatar, (x, y), avatar)
+            x += avatar_size + 5
+        except: continue
+
+    buffer = BytesIO()
+    img.save(buffer, format="PNG")
+    buffer.seek(0)
+    return buffer
+
 # ==== MATCH BUTTONS ====
 class MatchView(discord.ui.View):
-    def __init__(self, match_id, message: discord.Message):
+    def __init__(self, match_id, message: discord.Message, home_crest, away_crest):
         super().__init__(timeout=None)
         self.match_id = match_id
         self.message = message
+        self.home_crest = home_crest
+        self.away_crest = away_crest
 
     async def record_vote(self, interaction: discord.Interaction, prediction):
         user_id = str(interaction.user.id)
@@ -55,16 +108,20 @@ class MatchView(discord.ui.View):
             await interaction.response.send_message("❌ You already voted for this match.", ephemeral=True)
             return
 
+        # Save vote
         if user_id not in leaderboard:
-            leaderboard[user_id] = {"name": interaction.user.name, "points": 0, "predictions": {}}
+            leaderboard[user_id] = {"name": interaction.user.name, "points": 0, "predictions": {}, "avatar": interaction.user.display_avatar.url}
+        else:
+            leaderboard[user_id]["avatar"] = interaction.user.display_avatar.url
         leaderboard[user_id]["predictions"][str(self.match_id)] = prediction
         save_leaderboard()
 
-        # Update embed footer with all voters
+        # Regenerate image with all voter avatars
+        image_buffer = await generate_match_image(self.home_crest, self.away_crest, self.match_id)
+        file = discord.File(fp=image_buffer, filename="match.png")
         embed = self.message.embeds[0]
-        voters = [v["name"] for uid, v in leaderboard.items() if str(self.match_id) in v.get("predictions", {})]
-        embed.set_footer(text="Voters: " + ", ".join(voters))
-        await self.message.edit(embed=embed)
+        embed.set_image(url="attachment://match.png")
+        await self.message.edit(embed=embed, file=file)
 
         await interaction.response.send_message(f"✅ Prediction saved: **{prediction}**", ephemeral=True)
 
@@ -80,47 +137,42 @@ class MatchView(discord.ui.View):
     async def away(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self.record_vote(interaction, "AWAY_TEAM")
 
-# ==== LEADERBOARD RESET VIEW ====
-class LeaderboardResetConfirm(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=30)
+# ==== POST MATCH ====
+async def post_match(match):
+    # Skip finished/past games
+    match_time = datetime.fromisoformat(match['utcDate'].replace("Z", "+00:00"))
+    if match_time < datetime.now(timezone.utc):
+        return
 
-    @discord.ui.button(label="✅ Confirm Reset", style=discord.ButtonStyle.danger)
-    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message("🚫 You don’t have permission.", ephemeral=True)
-            return
+    channel = bot.get_channel(MATCH_CHANNEL_ID)
+    if not channel:
+        return
 
-        global leaderboard
-        leaderboard = {}
-        save_leaderboard()
-        await interaction.response.send_message("✅ Leaderboard has been reset!", ephemeral=True)
+    home_crest = match["homeTeam"].get("crest")
+    away_crest = match["awayTeam"].get("crest")
 
-        channel = bot.get_channel(LEADERBOARD_CHANNEL_ID)
-        if channel:
-            await channel.send("🔄 The leaderboard has been reset by an admin.")
+    embed = discord.Embed(
+        title=f"{match['homeTeam']['name']} vs {match['awayTeam']['name']}",
+        description=f"Kickoff: {match['utcDate']}",
+        color=discord.Color.blue()
+    )
 
-        self.stop()
+    image_buffer = await generate_match_image(home_crest, away_crest, match["id"])
+    file = discord.File(fp=image_buffer, filename="match.png")
+    embed.set_image(url="attachment://match.png")
 
-    @discord.ui.button(label="❌ Cancel", style=discord.ButtonStyle.secondary)
-    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_message("❌ Reset cancelled.", ephemeral=True)
-        self.stop()
+    msg = await channel.send(embed=embed, file=file)
+    view = MatchView(match["id"], msg, home_crest, away_crest)
+    await msg.edit(view=view, embed=embed, file=file)
 
-
-class LeaderboardView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)
-
-    @discord.ui.button(label="Reset Leaderboard", style=discord.ButtonStyle.danger)
-    async def reset(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message("🚫 You don’t have permission.", ephemeral=True)
-            return
-        await interaction.response.send_message(
-            "⚠️ Are you sure you want to reset the leaderboard?",
-            view=LeaderboardResetConfirm(), ephemeral=True
-        )
+# ==== AUTO POST MATCHES ====
+@tasks.loop(minutes=30)
+async def auto_post_matches():
+    matches = await fetch_matches()
+    if not matches:
+        return
+    for m in matches:
+        await post_match(m)
 
 # ==== FETCH MATCHES ====
 async def fetch_matches():
@@ -137,86 +189,9 @@ async def fetch_matches():
                     for m in data.get("matches", []):
                         m["competition"]["name"] = data.get("competition", {}).get("name", comp)
                         matches.append(m)
-    return matches
-
-# ==== CREATE MATCH IMAGE WITH CRESTS ====
-async def generate_match_image(home_url, away_url):
-    async with aiohttp.ClientSession() as session:
-        home_img_bytes, away_img_bytes = None, None
-        try:
-            async with session.get(home_url) as r:
-                home_img_bytes = await r.read()
-        except: pass
-        try:
-            async with session.get(away_url) as r:
-                away_img_bytes = await r.read()
-        except: pass
-
-    size = (100, 100)
-    img = Image.new("RGBA", (size[0]*2 + 40, size[1]), (255, 255, 255, 0))
-
-    if home_img_bytes:
-        home = Image.open(BytesIO(home_img_bytes)).convert("RGBA").resize(size)
-        img.paste(home, (0, 0), home)
-    if away_img_bytes:
-        away = Image.open(BytesIO(away_img_bytes)).convert("RGBA").resize(size)
-        img.paste(away, (size[0]+40, 0), away)
-
-    buffer = BytesIO()
-    img.save(buffer, format="PNG")
-    buffer.seek(0)
-    return buffer
-
-# ==== POST MATCH ====
-async def post_match(match):
-    channel = bot.get_channel(MATCH_CHANNEL_ID)
-    if not channel:
-        return
-
-    home_crest = match["homeTeam"].get("crest")
-    away_crest = match["awayTeam"].get("crest")
-
-    embed = discord.Embed(
-        title=f"{match['homeTeam']['name']} vs {match['awayTeam']['name']}",
-        description=f"Kickoff: {match['utcDate']}",
-        color=discord.Color.blue()
-    )
-
-    file = None
-    if home_crest or away_crest:
-        image_buffer = await generate_match_image(home_crest, away_crest)
-        file = discord.File(fp=image_buffer, filename="match.png")
-        embed.set_image(url="attachment://match.png")
-
-    # Send message first
-    msg = await channel.send(embed=embed, view=None if file is None else MatchView(match["id"], None))
-    
-    # Attach view with the message reference
-    view = MatchView(match["id"], msg)
-    await msg.edit(view=view, embed=embed, attachments=[file] if file else None)
-
-# ==== AUTO POST MATCHES BY LEAGUE ====
-@tasks.loop(minutes=30)
-async def auto_post_matches():
-    matches = await fetch_matches()
-    if not matches:
-        return
-
-    leagues = {}
-    for m in matches:
-        league_name = m["competition"]["name"]
-        leagues.setdefault(league_name, []).append(m)
-
-    channel = bot.get_channel(MATCH_CHANNEL_ID)
-    if not channel:
-        return
-
-    for league, league_matches in leagues.items():
-        embed = discord.Embed(title=f"🏆 {league} Matches", color=discord.Color.purple())
-        embed.description = "\n\n".join([f"{m['homeTeam']['name']} vs {m['awayTeam']['name']}\nKickoff: {m['utcDate']}" for m in league_matches])
-        await channel.send(embed=embed)
-        for m in league_matches:
-            await post_match(m)
+    # Filter only upcoming matches
+    upcoming = [m for m in matches if datetime.fromisoformat(m['utcDate'].replace("Z", "+00:00")) > datetime.now(timezone.utc)]
+    return upcoming
 
 # ==== COMMANDS ====
 @bot.tree.command(name="matches", description="Show upcoming matches.")
@@ -225,18 +200,8 @@ async def matches_command(interaction: discord.Interaction):
     if not matches:
         await interaction.response.send_message("No upcoming matches.", ephemeral=True)
         return
-
-    leagues = {}
     for m in matches[:10]:
-        league_name = m["competition"]["name"]
-        leagues.setdefault(league_name, []).append(m)
-
-    for league, league_matches in leagues.items():
-        embed = discord.Embed(title=f"🏆 {league} Matches", color=discord.Color.green())
-        embed.description = "\n\n".join([f"{m['homeTeam']['name']} vs {m['awayTeam']['name']}\nKickoff: {m['utcDate']}" for m in league_matches])
-        await interaction.channel.send(embed=embed)
-        for m in league_matches:
-            await post_match(m)
+        await post_match(m)
     await interaction.response.send_message("✅ Posted upcoming matches!", ephemeral=True)
 
 @bot.tree.command(name="leaderboard", description="Show the leaderboard.")
@@ -251,7 +216,7 @@ async def leaderboard_command(interaction: discord.Interaction):
                       for i, entry in enumerate(sorted_lb[:10])])
 
     embed = discord.Embed(title="🏆 Leaderboard", description=desc, color=discord.Color.gold())
-    await interaction.response.send_message(embed=embed, view=LeaderboardView())
+    await interaction.response.send_message(embed=embed)
 
 # ==== STARTUP ====
 @bot.event
