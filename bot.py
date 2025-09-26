@@ -3,6 +3,7 @@ import discord
 from discord.ext import tasks
 from discord import app_commands
 import requests
+from datetime import datetime, timezone
 
 # ----------------------
 # Bot setup
@@ -16,7 +17,7 @@ tree = app_commands.CommandTree(bot)
 # Environment variables
 # ----------------------
 TOKEN = os.environ.get("TOKEN")
-CHANNEL_ID = int(os.environ.get("CHANNEL_ID", 0))  # default channel
+CHANNEL_ID = int(os.environ.get("CHANNEL_ID", 0))  # default channel for auto-posting
 API_KEY = os.environ.get("API_KEY")
 
 # ----------------------
@@ -25,21 +26,34 @@ API_KEY = os.environ.get("API_KEY")
 server_points = {}  # guild_id -> {user_id -> points}
 user_bets = {}      # match_id -> {user_id: bet_choice}
 posted_matches = set()  # match IDs already posted
+match_lookup = {}   # match_id -> match info
 
 # ----------------------
-# Fetch upcoming matches
+# Fetch upcoming matches only
 # ----------------------
-def fetch_matches():
-    url = "https://api.football-data.org/v4/matches?status=SCHEDULED,FINISHED"
+def fetch_upcoming_matches():
+    url = "https://api.football-data.org/v4/matches"
     headers = {"X-Auth-Token": API_KEY}
     try:
         resp = requests.get(url, headers=headers)
-        print("API status:", resp.status_code)
         if resp.status_code != 200:
             print("API response:", resp.text[:500])
             return None
         data = resp.json()
-        return data.get("matches", [])
+        matches = data.get("matches", [])
+
+        # Only keep upcoming matches
+        upcoming = []
+        now = datetime.utcnow().replace(tzinfo=timezone.utc)
+        for m in matches:
+            status = m.get("status")
+            match_date_str = m.get("utcDate")
+            match_date = datetime.fromisoformat(match_date_str.replace("Z", "+00:00"))
+
+            # Keep only matches scheduled in the future
+            if status == "SCHEDULED" and match_date > now:
+                upcoming.append(m)
+        return upcoming
     except Exception as e:
         print("Fetch error:", e)
         return None
@@ -69,10 +83,28 @@ class BetView(discord.ui.View):
         self.match_id = match_id
 
     async def record_bet(self, interaction: discord.Interaction, choice: str):
+        match = match_lookup.get(self.match_id)
+        if not match:
+            await interaction.response.send_message("❌ Match not found!", ephemeral=True)
+            return
+
+        status = match.get("status")
+        match_time_str = match.get("utcDate")
+        match_time = datetime.fromisoformat(match_time_str.replace("Z", "+00:00"))
+        now = datetime.utcnow().replace(tzinfo=timezone.utc)
+
+        if status != "SCHEDULED" or match_time <= now:
+            await interaction.response.send_message("❌ Betting is closed for this match!", ephemeral=True)
+            return
+
         if self.match_id not in user_bets:
             user_bets[self.match_id] = {}
+        if interaction.user.id in user_bets[self.match_id]:
+            await interaction.response.send_message("❌ You already placed a bet on this match!", ephemeral=True)
+            return
+
         user_bets[self.match_id][interaction.user.id] = choice
-        await interaction.response.send_message(f"You bet on {choice.capitalize()}!", ephemeral=True)
+        await interaction.response.send_message(f"✅ You bet on {choice.capitalize()}!", ephemeral=True)
 
     @discord.ui.button(label="Home Win", style=discord.ButtonStyle.green)
     async def home_win(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -92,9 +124,9 @@ class BetView(discord.ui.View):
 @tree.command(name="matches", description="Show upcoming matches")
 async def matches_cmd(interaction: discord.Interaction):
     await interaction.response.defer()
-    match_list = fetch_matches()
+    match_list = fetch_upcoming_matches()
     if not match_list:
-        await interaction.followup.send("❌ Error fetching matches. Please try again later.")
+        await interaction.followup.send("❌ No upcoming matches found.")
         return
 
     for m in match_list[:5]:
@@ -102,6 +134,7 @@ async def matches_cmd(interaction: discord.Interaction):
         away = m["awayTeam"]["name"]
         home_logo = m["homeTeam"].get("crest", "")
         away_logo = m["awayTeam"].get("crest", "")
+        match_lookup[m["id"]] = m  # save for betting
 
         embed = discord.Embed(
             title=f"{home} vs {away}",
@@ -120,9 +153,7 @@ async def leaderboard(interaction: discord.Interaction):
         await interaction.response.send_message("No scores yet in this server. Be the first to bet! ⚽")
         return
 
-    # Sort top 10 users by points
     sorted_points = sorted(points_dict.items(), key=lambda x: x[1], reverse=True)[:10]
-
     lines = []
     medals = ["🥇", "🥈", "🥉"]
     for i, (user_id, pts) in enumerate(sorted_points):
@@ -151,16 +182,17 @@ async def auto_post_matches():
         print("Channel not found.")
         return
 
-    matches = fetch_matches()
+    matches = fetch_upcoming_matches()
     if not matches:
-        print("No matches fetched for auto-post.")
+        print("No upcoming matches to post.")
         return
 
     for m in matches:
         if m["id"] in posted_matches:
             continue
-        if m.get("status") != "SCHEDULED":
-            continue
+        posted_matches.add(m["id"])
+        match_lookup[m["id"]] = m
+
         home = m["homeTeam"]["name"]
         away = m["awayTeam"]["name"]
         home_logo = m["homeTeam"].get("crest", "")
@@ -174,7 +206,6 @@ async def auto_post_matches():
         embed.set_thumbnail(url=home_logo or away_logo)
 
         await channel.send(embed=embed, view=BetView(m["id"]))
-        posted_matches.add(m["id"])
         print(f"Posted match: {home} vs {away}")
 
 # ----------------------
@@ -182,9 +213,11 @@ async def auto_post_matches():
 # ----------------------
 @tasks.loop(minutes=5)
 async def score_matches():
-    matches = fetch_matches()
+    matches = fetch_upcoming_matches()
     if not matches:
         return
+
+    now = datetime.utcnow().replace(tzinfo=timezone.utc)
 
     for m in matches:
         if m.get("status") != "FINISHED":
@@ -194,17 +227,13 @@ async def score_matches():
         if not result or match_id not in user_bets:
             continue
 
-        # Award points per server
         for guild_id in server_points.keys():
-            if match_id in user_bets:
-                for user_id, bet in user_bets[match_id].items():
-                    if bet == result:
-                        if guild_id not in server_points:
-                            server_points[guild_id] = {}
-                        server_points[guild_id][user_id] = server_points[guild_id].get(user_id, 0) + 1
-                del user_bets[match_id]
-
-        print(f"Scored match {match_id}, updated points.")
+            for user_id, bet in user_bets[match_id].items():
+                if bet == result:
+                    if guild_id not in server_points:
+                        server_points[guild_id] = {}
+                    server_points[guild_id][user_id] = server_points[guild_id].get(user_id, 0) + 1
+        del user_bets[match_id]
 
 # ----------------------
 # Bot events
