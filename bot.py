@@ -1,143 +1,70 @@
-import discord
-from discord.ext import commands, tasks
-from discord.ui import Button, View
-import requests
-from datetime import datetime, timedelta
-import json
 import os
+import discord
+from discord.ext import tasks
+from discord import app_commands
+import requests
 
-# ------------------ CONFIG ------------------
-# Use environment variables for secrets
-TOKEN = os.environ["TOKEN"]
-CHANNEL_ID = int(os.environ["CHANNEL_ID"])  # must be integer
-API_KEY = os.environ["API_KEY"]
-
-# Leagues to track (PL=EPL, PD=La Liga, SA=Serie A, CL=Champions League, EL=Europa League, WC=World Cup)
-LEAGUES = "PL,PD,SA,CL,EL,WC"
-
-# ------------------ BOT SETUP ------------------
+# Bot setup
 intents = discord.Intents.default()
 intents.message_content = True
-bot = commands.Bot(command_prefix="!", intents=intents)
+bot = discord.Client(intents=intents)
+tree = app_commands.CommandTree(bot)
 
-points = {}  # user_id -> score
-active_matches = {}  # match_id -> {"team1": str, "team2": str, "bets": {user_id: choice}}
+# Environment variables
+TOKEN = os.environ.get("TOKEN")
+CHANNEL_ID = int(os.environ.get("CHANNEL_ID", 0))
+API_KEY = os.environ.get("API_KEY")
 
-headers = {"X-Auth-Token": API_KEY}
+# Simple points leaderboard
+points = {}
 
-# ------------------ HELPER FUNCTIONS ------------------
-def save_points():
-    with open("points.json", "w") as f:
-        json.dump(points, f)
+# Active matches (for testing)
+active_matches = {}
 
-def load_points():
-    global points
+# Debug function to fetch matches
+def fetch_matches():
+    url = "https://api.football-data.org/v4/matches?status=SCHEDULED"
+    headers = {"X-Auth-Token": API_KEY}
     try:
-        with open("points.json", "r") as f:
-            points = json.load(f)
-    except FileNotFoundError:
-        points = {}
+        resp = requests.get(url, headers=headers)
+        print("API status:", resp.status_code)
+        print(resp.text[:500])  # first 500 chars
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        return data.get("matches", [])
+    except Exception as e:
+        print("Fetch error:", e)
+        return None
 
-def fetch_upcoming_matches():
-    url = f"https://api.football-data.org/v4/matches?competitions={LEAGUES}"
-    resp = requests.get(url, headers=headers).json()
-    matches = []
-    for match in resp.get("matches", []):
-        if match["status"] == "SCHEDULED":
-            match_time = datetime.fromisoformat(match["utcDate"].replace("Z","+00:00"))
-            # include matches starting within 1 hour
-            if datetime.utcnow() <= match_time <= datetime.utcnow() + timedelta(hours=1):
-                matches.append(match)
-    return matches
+# Slash commands
+@tree.command(name="matches", description="Show upcoming matches")
+async def matches_cmd(interaction: discord.Interaction):
+    match_list = fetch_matches()
+    if not match_list:
+        await interaction.response.send_message("❌ Error fetching matches. Please try again later.")
+        return
+    msg = ""
+    for m in match_list[:5]:
+        home = m["homeTeam"]["name"]
+        away = m["awayTeam"]["name"]
+        msg += f"{home} vs {away}\n"
+    await interaction.response.send_message(msg)
 
-# ------------------ BOT EVENTS ------------------
+@tree.command(name="leaderboard", description="Show top scores")
+async def leaderboard(interaction: discord.Interaction):
+    if not points:
+        await interaction.response.send_message("No scores yet.")
+        return
+    sorted_points = sorted(points.items(), key=lambda x: x[1], reverse=True)
+    msg = "\n".join([f"<@{user}>: {pts}" for user, pts in sorted_points[:10]])
+    await interaction.response.send_message(f"🏆 Leaderboard 🏆\n{msg}")
+
+# On ready
 @bot.event
 async def on_ready():
+    await tree.sync()
     print(f"Logged in as {bot.user}")
-    load_points()
-    check_matches.start()
 
-# ------------------ SCHEDULER ------------------
-@tasks.loop(minutes=5)
-async def check_matches():
-    channel = bot.get_channel(CHANNEL_ID)
-    if not channel:
-        print("Channel not found!")
-        return
-
-    matches = fetch_upcoming_matches()
-    for match in matches:
-        match_id = str(match["id"])
-        if match_id in active_matches:
-            continue  # already posted
-
-        team1 = match["homeTeam"]["name"]
-        team2 = match["awayTeam"]["name"]
-        active_matches[match_id] = {"team1": team1, "team2": team2, "bets": {}}
-
-        # Create buttons
-        button1 = Button(label=team1, style=discord.ButtonStyle.primary)
-        button_draw = Button(label="Draw", style=discord.ButtonStyle.secondary)
-        button2 = Button(label=team2, style=discord.ButtonStyle.primary)
-
-        async def bet_callback(interaction, choice):
-            user_id = str(interaction.user.id)
-            if user_id in active_matches[match_id]["bets"]:
-                await interaction.response.send_message("You already placed a bet!", ephemeral=True)
-                return
-            active_matches[match_id]["bets"][user_id] = choice
-            await interaction.response.send_message(f"You picked **{choice}**!", ephemeral=True)
-
-        button1.callback = lambda i: bet_callback(i, team1)
-        button_draw.callback = lambda i: bet_callback(i, "Draw")
-        button2.callback = lambda i: bet_callback(i, team2)
-
-        view = View()
-        view.add_item(button1)
-        view.add_item(button_draw)
-        view.add_item(button2)
-
-        embed = discord.Embed(
-            title="⚽ Upcoming Match",
-            description=f"{team1} vs {team2}\nKickoff: {match['utcDate']}",
-            color=discord.Color.blue()
-        )
-        await channel.send(embed=embed, view=view)
-
-    # Check finished matches
-    url = f"https://api.football-data.org/v4/matches?competitions={LEAGUES}"
-    resp = requests.get(url, headers=headers).json()
-    for match in resp.get("matches", []):
-        match_id = str(match["id"])
-        if match["status"] == "FINISHED" and match_id in active_matches:
-            winner = None
-            if match["score"]["winner"] == "HOME_TEAM":
-                winner = active_matches[match_id]["team1"]
-            elif match["score"]["winner"] == "AWAY_TEAM":
-                winner = active_matches[match_id]["team2"]
-            else:
-                winner = "Draw"
-
-            results = []
-            for user, choice in active_matches[match_id]["bets"].items():
-                if choice == winner:
-                    points[user] = points.get(user, 0) + 1
-                    results.append(f"<@{user}> ✅ guessed right! (+1)")
-                else:
-                    results.append(f"<@{user}> ❌ guessed wrong.")
-            save_points()
-            await channel.send(
-                f"Results for **{active_matches[match_id]['team1']} vs {active_matches[match_id]['team2']}**:\n" +
-                "\n".join(results)
-            )
-            del active_matches[match_id]
-
-# ------------------ COMMANDS ------------------
-@bot.command()
-async def leaderboard(ctx):
-    sorted_points = sorted(points.items(), key=lambda x: x[1], reverse=True)
-    lb = "\n".join([f"<@{user}>: {pts}" for user, pts in sorted_points[:10]])
-    await ctx.send("🏆 Leaderboard 🏆\n" + (lb if lb else "No scores yet."))
-
-# ------------------ RUN BOT ------------------
+# Run the bot
 bot.run(TOKEN)
