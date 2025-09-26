@@ -3,11 +3,11 @@ import json
 import aiohttp
 import asyncio
 from datetime import datetime, timezone, timedelta
+from io import BytesIO
+from PIL import Image
 import discord
 from discord.ext import commands, tasks
 from discord import app_commands
-from PIL import Image
-from io import BytesIO
 
 # ==== ENVIRONMENT VARIABLES ====
 DISCORD_BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN")
@@ -20,7 +20,6 @@ if not all([DISCORD_BOT_TOKEN, FOOTBALL_DATA_API_KEY, MATCH_CHANNEL_ID, LEADERBO
 
 # ==== BOT SETUP ====
 intents = discord.Intents.default()
-intents.members = True  # for user avatars
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # Leaderboard persistence
@@ -43,22 +42,43 @@ def save_leaderboard():
 
 # ==== MATCH BUTTONS ====
 class MatchView(discord.ui.View):
-    def __init__(self, match_id):
+    def __init__(self, match):
         super().__init__(timeout=None)
-        self.match_id = match_id
+        self.match = match
 
     async def handle_vote(self, interaction: discord.Interaction, prediction: str):
         user_id = str(interaction.user.id)
-        if user_id not in leaderboard:
-            leaderboard[user_id] = {"name": interaction.user.name, "points": 0, "predictions": {}}
+        now = datetime.now(timezone.utc)
+        match_time = datetime.fromisoformat(self.match["utcDate"].replace("Z","+00:00"))
 
-        if str(self.match_id) in leaderboard[user_id]["predictions"]:
-            await interaction.response.send_message("⚠️ You already voted for this match.", ephemeral=True)
+        if match_time <= now:
+            await interaction.response.send_message("⚠️ This match has already started. Voting is closed.", ephemeral=True)
             return
 
-        leaderboard[user_id]["predictions"][str(self.match_id)] = prediction
+        if user_id not in leaderboard:
+            leaderboard[user_id] = {
+                "name": interaction.user.name,
+                "avatar": str(interaction.user.display_avatar.url),
+                "points": 0,
+                "predictions": {}
+            }
+
+        if str(self.match["id"]) in leaderboard[user_id]["predictions"]:
+            await interaction.response.send_message("✅ You already voted for this match.", ephemeral=True)
+            return
+
+        # Save prediction
+        leaderboard[user_id]["predictions"][str(self.match["id"])] = prediction
+        leaderboard[user_id]["avatar"] = str(interaction.user.display_avatar.url)
         save_leaderboard()
-        await interaction.response.send_message(f"✅ Voted for **{prediction}**!", ephemeral=True)
+
+        # Disable buttons for this user only
+        for item in self.children:
+            if hasattr(item, "label"):
+                item.disabled = True
+                item.label = "Voted!" if item.label == prediction else item.label
+
+        await interaction.response.send_message(f"✅ Voted: **{prediction}**", ephemeral=True)
 
     @discord.ui.button(label="Home Win", style=discord.ButtonStyle.primary)
     async def home(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -72,7 +92,7 @@ class MatchView(discord.ui.View):
     async def away(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self.handle_vote(interaction, "AWAY_TEAM")
 
-# ==== LEADERBOARD RESET VIEW ====
+# ==== LEADERBOARD RESET ====
 class LeaderboardResetConfirm(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=30)
@@ -99,6 +119,7 @@ class LeaderboardResetConfirm(discord.ui.View):
         await interaction.response.send_message("❌ Reset cancelled.", ephemeral=True)
         self.stop()
 
+
 class LeaderboardView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
@@ -108,8 +129,10 @@ class LeaderboardView(discord.ui.View):
         if not interaction.user.guild_permissions.administrator:
             await interaction.response.send_message("🚫 You don’t have permission.", ephemeral=True)
             return
-        await interaction.response.send_message("⚠️ Are you sure you want to reset the leaderboard?", 
-                                                view=LeaderboardResetConfirm(), ephemeral=True)
+        await interaction.response.send_message(
+            "⚠️ Are you sure you want to reset the leaderboard?", 
+            view=LeaderboardResetConfirm(), ephemeral=True
+        )
 
 # ==== FETCH MATCHES ====
 async def fetch_matches():
@@ -123,10 +146,41 @@ async def fetch_matches():
             async with session.get(url, headers=HEADERS) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    for match in data.get("matches", []):
-                        match["competition_code"] = comp
-                        matches.append(match)
+                    for m in data.get("matches", []):
+                        # Skip past or finished games
+                        match_time = datetime.fromisoformat(m["utcDate"].replace("Z","+00:00"))
+                        if match_time >= now:
+                            matches.append(m)
     return matches
+
+# ==== CREATE MATCH IMAGE ====
+async def create_match_image(match):
+    width, height = 400, 200
+    home_url = match["homeTeam"].get("crest", "")
+    away_url = match["awayTeam"].get("crest", "")
+    home_img, away_img = None, None
+
+    async with aiohttp.ClientSession() as session:
+        if home_url:
+            try:
+                async with session.get(home_url) as r:
+                    data = await r.read()
+                    home_img = Image.open(BytesIO(data)).convert("RGBA").resize((120, 120))
+            except: pass
+        if away_url:
+            try:
+                async with session.get(away_url) as r:
+                    data = await r.read()
+                    away_img = Image.open(BytesIO(data)).convert("RGBA").resize((120, 120))
+            except: pass
+
+    canvas = Image.new("RGBA", (width, height), (255,255,255,0))
+    if home_img: canvas.paste(home_img, (20, 40), home_img)
+    if away_img: canvas.paste(away_img, (260, 40), away_img)
+    bio = BytesIO()
+    canvas.save(bio, "PNG")
+    bio.seek(0)
+    return bio
 
 # ==== POST MATCH ====
 async def post_match(match):
@@ -134,42 +188,20 @@ async def post_match(match):
     if not channel:
         return
 
-    # Fetch home/away crest images
-    async with aiohttp.ClientSession() as session:
-        home_crest_url = match['homeTeam'].get('crest') or ""
-        away_crest_url = match['awayTeam'].get('crest') or ""
-        home_image, away_image = None, None
-        if home_crest_url:
-            async with session.get(home_crest_url) as r:
-                if r.status == 200:
-                    home_image = Image.open(BytesIO(await r.read())).resize((64,64))
-        if away_crest_url:
-            async with session.get(away_crest_url) as r:
-                if r.status == 200:
-                    away_image = Image.open(BytesIO(await r.read())).resize((64,64))
-
-        # Combine images side by side
-        if home_image or away_image:
-            combined = Image.new("RGBA", (128,64), (255,255,255,0))
-            if home_image:
-                combined.paste(home_image, (0,0))
-            if away_image:
-                combined.paste(away_image, (64,0))
-            buffer = BytesIO()
-            combined.save(buffer, format="PNG")
-            buffer.seek(0)
-            file = discord.File(fp=buffer, filename="match.png")
-        else:
-            file = None
-
     embed = discord.Embed(
         title=f"{match['homeTeam']['name']} vs {match['awayTeam']['name']}",
         description=f"Kickoff: {match['utcDate']}",
         color=discord.Color.blue()
     )
-    await channel.send(embed=embed, file=file, view=MatchView(match["id"]))
 
-# ==== BACKGROUND AUTO POST ====
+    # Attach image
+    img_bytes = await create_match_image(match)
+    file = discord.File(img_bytes, filename="match.png")
+    embed.set_image(url="attachment://match.png")
+
+    await channel.send(embed=embed, file=file, view=MatchView(match))
+
+# ==== AUTO POST ====
 @tasks.loop(minutes=30)
 async def auto_post_matches():
     matches = await fetch_matches()
@@ -177,16 +209,19 @@ async def auto_post_matches():
         return
 
     # Group by league
-    league_matches = {}
-    for m in matches:
-        league_matches.setdefault(m["competition_code"], []).append(m)
+    leagues = {}
+    for match in matches:
+        comp = match["competition"]["name"]
+        if comp not in leagues:
+            leagues[comp] = []
+        leagues[comp].append(match)
 
-    for league, matches_list in league_matches.items():
+    for league_name, league_matches in leagues.items():
         channel = bot.get_channel(MATCH_CHANNEL_ID)
         if channel:
-            await channel.send(f"🏆 **{league} Matches**")
-            for match in matches_list:
-                await post_match(match)
+            await channel.send(f"🏆 **{league_name} Matches**")
+            for m in league_matches:
+                await post_match(m)
 
 # ==== COMMANDS ====
 @bot.tree.command(name="matches", description="Show upcoming matches.")
@@ -196,29 +231,33 @@ async def matches_command(interaction: discord.Interaction):
         await interaction.response.send_message("No upcoming matches.", ephemeral=True)
         return
 
-    league_matches = {}
-    for m in matches[:10]:
-        league_matches.setdefault(m["competition_code"], []).append(m)
+    # Group by league
+    leagues = {}
+    for match in matches:
+        comp = match["competition"]["name"]
+        if comp not in leagues:
+            leagues[comp] = []
+        leagues[comp].append(match)
 
-    for league, matches_list in league_matches.items():
-        await interaction.channel.send(f"🏆 **{league} Matches**")
-        for match in matches_list:
-            await post_match(match)
-
+    for league_name, league_matches in leagues.items():
+        await interaction.channel.send(f"🏆 **{league_name} Matches**")
+        for m in league_matches[:5]:
+            await post_match(m)
     await interaction.response.send_message("✅ Posted upcoming matches!", ephemeral=True)
 
 @bot.tree.command(name="leaderboard", description="Show the leaderboard.")
 async def leaderboard_command(interaction: discord.Interaction):
     if not leaderboard:
-        # If empty, show users who voted
-        sorted_lb = sorted([(uid, data) for uid,data in leaderboard.items()], key=lambda x: x[1]["name"])
-    else:
-        # Sort by points, then alphabetically
-        sorted_lb = sorted(leaderboard.items(), key=lambda x: (-x[1]["points"], x[1]["name"]))
+        await interaction.response.send_message("Leaderboard is empty.", ephemeral=True)
+        return
 
+    # Sort: points descending, if tie sort alphabetically
+    sorted_lb = sorted(
+        leaderboard.values(),
+        key=lambda x: (-x["points"], x["name"])
+    )
     desc = "\n".join([f"**{i+1}. {entry['name']}** — {entry['points']} pts"
-                      for i, (uid, entry) in enumerate(sorted_lb[:10])])
-
+                      for i, entry in enumerate(sorted_lb[:10])])
     embed = discord.Embed(title="🏆 Leaderboard", description=desc, color=discord.Color.gold())
     await interaction.response.send_message(embed=embed, view=LeaderboardView())
 
