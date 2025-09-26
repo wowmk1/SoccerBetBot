@@ -8,8 +8,8 @@ from datetime import datetime, timezone, timedelta
 TOKEN = "YOUR_DISCORD_BOT_TOKEN"  # Replace with your Discord bot token
 API_KEY = "YOUR_FOOTBALL_DATA_API_KEY"  # Replace with your football-data API key
 
-LEADERBOARD_CHANNEL_ID = 1421221580159320084  # Replace with your leaderboard channel ID
-POST_CHANNEL_ID = 1421208643558179009         # Replace with your match posting channel ID
+LEADERBOARD_CHANNEL_ID = 12345678990  # Replace with your leaderboard channel ID
+POST_CHANNEL_ID = 1234567890         # Replace with your match posting channel ID
 
 TRACKED_COMPETITIONS = [
     "WC",    # FIFA World Cup
@@ -246,3 +246,4 @@ async def leaderboard_cmd(interaction: discord.Interaction):
 
 # ------------------ RUN BOT ------------------
 bot.run(TOKEN)
+
