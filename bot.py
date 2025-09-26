@@ -18,12 +18,13 @@ if not all([DISCORD_BOT_TOKEN, FOOTBALL_DATA_API_KEY, MATCH_CHANNEL_ID, LEADERBO
 
 # ==== BOT SETUP ====
 intents = discord.Intents.default()
+intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # Leaderboard persistence
 LEADERBOARD_FILE = "leaderboard.json"
 if os.path.exists(LEADERBOARD_FILE):
-    with open(LEADERBOARD_FILE, "r") as f:
+    with open(LEADERBOARD_FILE, "r", encoding="utf-8") as f:
         leaderboard = json.load(f)
 else:
     leaderboard = {}
@@ -35,15 +36,15 @@ COMPETITIONS = ["PL", "CL", "BL1", "DED", "PD", "FL1", "ELC", "PPL", "SA", "EC",
 
 # ==== SAVE LEADERBOARD ====
 def save_leaderboard():
-    with open(LEADERBOARD_FILE, "w") as f:
-        json.dump(leaderboard, f)
+    with open(LEADERBOARD_FILE, "w", encoding="utf-8") as f:
+        json.dump(leaderboard, f, ensure_ascii=False, indent=2)
 
 # ==== MATCH BUTTONS ====
 class MatchView(discord.ui.View):
     def __init__(self, match_id):
         super().__init__(timeout=None)
         self.match_id = match_id
-        self.user_votes = {}  # user_id -> prediction
+        self.user_votes = {}
 
     def get_button_style(self, user_id, prediction):
         if str(user_id) in self.user_votes and self.user_votes[str(user_id)] == prediction:
@@ -63,13 +64,22 @@ class MatchView(discord.ui.View):
         leaderboard[user_id]["predictions"][str(self.match_id)] = prediction
         save_leaderboard()
 
-        # Update button colors for this user only
+        # Create a disabled view for this user
+        disabled_view = discord.ui.View()
         for child in self.children:
             label_key = child.label.replace(" ", "_").upper()
-            child.style = self.get_button_style(user_id, label_key)
+            button = discord.ui.Button(
+                label=child.label,
+                style=self.get_button_style(user_id, label_key),
+                disabled=True
+            )
+            disabled_view.add_item(button)
 
-        # Send ephemeral confirmation so other users can still vote
-        await interaction.response.send_message(f"✅ You voted: **{prediction}**", ephemeral=True)
+        await interaction.response.send_message(
+            f"✅ You voted: **{prediction}**",
+            ephemeral=True,
+            view=disabled_view
+        )
 
     @discord.ui.button(label="Home Win", style=discord.ButtonStyle.primary)
     async def home(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -117,7 +127,7 @@ class LeaderboardView(discord.ui.View):
         if not interaction.user.guild_permissions.administrator:
             await interaction.response.send_message("🚫 You don’t have permission.", ephemeral=True)
             return
-        await interaction.response.send_message("⚠️ Are you sure you want to reset the leaderboard?", 
+        await interaction.response.send_message("⚠️ Are you sure you want to reset the leaderboard?",
                                                 view=LeaderboardResetConfirm(), ephemeral=True)
 
 # ==== FETCH MATCHES ====
@@ -133,8 +143,9 @@ async def fetch_matches():
                 if resp.status == 200:
                     data = await resp.json()
                     matches.extend(data.get("matches", []))
+                else:
+                    print(f"Failed to fetch matches for {comp}: {resp.status}")
 
-    # Only upcoming matches
     matches = [m for m in matches if datetime.fromisoformat(m["utcDate"].replace("Z", "+00:00")) > now]
     return matches
 
@@ -183,9 +194,8 @@ async def leaderboard_command(interaction: discord.Interaction):
         await interaction.response.send_message("Leaderboard is empty.", ephemeral=True)
         return
 
-    # Sort by points descending, then alphabetical
     sorted_lb = sorted(
-        leaderboard.values(), 
+        leaderboard.values(),
         key=lambda x: (-x["points"], x["name"].lower())
     )
     desc = "\n".join([f"**{i+1}. {entry['name']}** — {entry['points']} pts"
