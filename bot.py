@@ -42,25 +42,31 @@ def save_leaderboard():
 
 # ==== MATCH BUTTONS ====
 class MatchView(discord.ui.View):
-    def __init__(self, match_id):
+    def __init__(self, match_id, message: discord.Message):
         super().__init__(timeout=None)
         self.match_id = match_id
+        self.message = message
 
     async def record_vote(self, interaction: discord.Interaction, prediction):
         user_id = str(interaction.user.id)
+
+        # One vote per user per match
+        if user_id in leaderboard and str(self.match_id) in leaderboard[user_id].get("predictions", {}):
+            await interaction.response.send_message("❌ You already voted for this match.", ephemeral=True)
+            return
+
         if user_id not in leaderboard:
             leaderboard[user_id] = {"name": interaction.user.name, "points": 0, "predictions": {}}
         leaderboard[user_id]["predictions"][str(self.match_id)] = prediction
         save_leaderboard()
 
-        # Ephemeral confirmation with user's avatar under match
-        embed = discord.Embed(
-            title=f"You voted for {interaction.user.name}",
-            description=f"✅ Prediction saved: **{prediction}**",
-            color=discord.Color.green()
-        )
-        embed.set_thumbnail(url=interaction.user.display_avatar.url)
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        # Update embed footer with all voters
+        embed = self.message.embeds[0]
+        voters = [v["name"] for uid, v in leaderboard.items() if str(self.match_id) in v.get("predictions", {})]
+        embed.set_footer(text="Voters: " + ", ".join(voters))
+        await self.message.edit(embed=embed)
+
+        await interaction.response.send_message(f"✅ Prediction saved: **{prediction}**", ephemeral=True)
 
     @discord.ui.button(label="Home Win", style=discord.ButtonStyle.primary)
     async def home(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -148,7 +154,6 @@ async def generate_match_image(home_url, away_url):
 
     size = (100, 100)
     img = Image.new("RGBA", (size[0]*2 + 40, size[1]), (255, 255, 255, 0))
-    draw = ImageDraw.Draw(img)
 
     if home_img_bytes:
         home = Image.open(BytesIO(home_img_bytes)).convert("RGBA").resize(size)
@@ -171,23 +176,24 @@ async def post_match(match):
     home_crest = match["homeTeam"].get("crest")
     away_crest = match["awayTeam"].get("crest")
 
+    embed = discord.Embed(
+        title=f"{match['homeTeam']['name']} vs {match['awayTeam']['name']}",
+        description=f"Kickoff: {match['utcDate']}",
+        color=discord.Color.blue()
+    )
+
+    file = None
     if home_crest or away_crest:
         image_buffer = await generate_match_image(home_crest, away_crest)
         file = discord.File(fp=image_buffer, filename="match.png")
-        embed = discord.Embed(
-            title=f"{match['homeTeam']['name']} vs {match['awayTeam']['name']}",
-            description=f"Kickoff: {match['utcDate']}",
-            color=discord.Color.blue()
-        )
         embed.set_image(url="attachment://match.png")
-        await channel.send(embed=embed, view=MatchView(match["id"]), file=file)
-    else:
-        embed = discord.Embed(
-            title=f"{match['homeTeam']['name']} vs {match['awayTeam']['name']}",
-            description=f"Kickoff: {match['utcDate']}",
-            color=discord.Color.blue()
-        )
-        await channel.send(embed=embed, view=MatchView(match["id"]))
+
+    # Send message first
+    msg = await channel.send(embed=embed, view=None if file is None else MatchView(match["id"], None))
+    
+    # Attach view with the message reference
+    view = MatchView(match["id"], msg)
+    await msg.edit(view=view, embed=embed, attachments=[file] if file else None)
 
 # ==== AUTO POST MATCHES BY LEAGUE ====
 @tasks.loop(minutes=30)
@@ -196,7 +202,6 @@ async def auto_post_matches():
     if not matches:
         return
 
-    # Group by league
     leagues = {}
     for m in matches:
         league_name = m["competition"]["name"]
@@ -221,7 +226,6 @@ async def matches_command(interaction: discord.Interaction):
         await interaction.response.send_message("No upcoming matches.", ephemeral=True)
         return
 
-    # Group by league
     leagues = {}
     for m in matches[:10]:
         league_name = m["competition"]["name"]
