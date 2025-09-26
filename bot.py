@@ -58,13 +58,17 @@ class MatchView(discord.ui.View):
 
     async def record_vote(self, interaction: discord.Interaction, prediction: str):
         user_id = str(interaction.user.id)
-        self.user_votes[user_id] = prediction
         if user_id not in leaderboard:
             leaderboard[user_id] = {"name": interaction.user.name, "points": 0, "predictions": {}}
+
+        if str(self.match_id) in leaderboard[user_id]["predictions"]:
+            await interaction.response.send_message("🚫 You've already voted on this match.", ephemeral=True)
+            return
+
+        self.user_votes[user_id] = prediction
         leaderboard[user_id]["predictions"][str(self.match_id)] = prediction
         save_leaderboard()
 
-        # Create a disabled view for this user
         disabled_view = discord.ui.View()
         for child in self.children:
             label_key = child.label.replace(" ", "_").upper()
@@ -160,6 +164,7 @@ async def post_match(match):
         description=f"Kickoff: {match['utcDate']}",
         color=discord.Color.blue()
     )
+    embed.set_thumbnail(url=match['homeTeam'].get('crest'))
     await channel.send(embed=embed, view=MatchView(match["id"]))
 
 # ==== BACKGROUND AUTO POST ====
@@ -185,6 +190,7 @@ async def matches_command(interaction: discord.Interaction):
             description=f"Kickoff: {match['utcDate']}",
             color=discord.Color.green()
         )
+        embed.set_thumbnail(url=match['homeTeam'].get('crest'))
         await interaction.channel.send(embed=embed, view=MatchView(match["id"]))
     await interaction.response.send_message("✅ Posted upcoming matches!", ephemeral=True)
 
