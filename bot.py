@@ -1,159 +1,197 @@
 import os
-import asyncio
-from datetime import datetime, timedelta, timezone
-import aiohttp
 import discord
-from discord.ext import tasks, commands
+from discord.ext import commands, tasks
 from discord import app_commands
+import aiohttp
+from datetime import datetime, timezone, timedelta
 
-# ------------------ CONFIG ------------------
-DISCORD_BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN")
-FOOTBALL_DATA_API_KEY = os.environ.get("FOOTBALL_DATA_API_KEY")
+# ---------------- CONFIG ----------------
+TOKEN = os.environ.get("DISCORD_BOT_TOKEN")
+API_KEY = os.environ.get("FOOTBALL_DATA_API_KEY")
 MATCH_CHANNEL_ID = int(os.environ.get("MATCH_CHANNEL_ID"))
 LEADERBOARD_CHANNEL_ID = int(os.environ.get("LEADERBOARD_CHANNEL_ID"))
 
-if not all([DISCORD_BOT_TOKEN, FOOTBALL_DATA_API_KEY, MATCH_CHANNEL_ID, LEADERBOARD_CHANNEL_ID]):
-    raise ValueError("Missing one or more required environment variables.")
+if not all([TOKEN, API_KEY, MATCH_CHANNEL_ID, LEADERBOARD_CHANNEL_ID]):
+    raise ValueError("Missing environment variables: DISCORD_BOT_TOKEN, FOOTBALL_DATA_API_KEY, MATCH_CHANNEL_ID, LEADERBOARD_CHANNEL_ID")
 
-# ------------------ LEAGUES ------------------
-LEAGUES = {
-    "WC": "FIFA World Cup",
-    "CL": "UEFA Champions League",
-    "BL1": "Bundesliga",
-    "DED": "Eredivisie",
-    "PD": "Primera Division",
-    "FL1": "Ligue 1",
-    "ELC": "Championship",
-    "PPL": "Primeira Liga",
-    "EC": "European Championship",
-    "SA": "Serie A",
-    "PL": "Premier League"
-}
+LEAGUES = ["PL", "BL1", "PD", "SA", "FL1", "DED", "PPL", "ELC", "CL", "WC", "EC"]
 
-# ------------------ BOT ------------------
 intents = discord.Intents.default()
-intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
-tree = bot.tree
 
-# Store posted matches to prevent double-posting
 posted_matches = set()
-# Store bets {user_id: {match_id: choice}}
-bets = {}
-# Store scores {user_id: points}
-scores = {}
+predictions = {}   # {match_id: {user_id: "HOME"/"DRAW"/"AWAY"}}
+leaderboard = {}   # {user_id: points}
 
-# ------------------ FETCH MATCHES ------------------
+# --------------- FETCH MATCHES ---------------
 async def fetch_matches():
     url = "https://api.football-data.org/v4/matches"
-    today = datetime.now(timezone.utc).date()
-    two_days_later = today + timedelta(days=2)
-
+    headers = {"X-Auth-Token": API_KEY}
+    now = datetime.now(timezone.utc)
     params = {
-        "dateFrom": today.isoformat(),
-        "dateTo": two_days_later.isoformat(),
-        "competitions": ",".join(LEAGUES.keys())
+        "dateFrom": now.date().isoformat(),
+        "dateTo": (now + timedelta(days=2)).date().isoformat(),
     }
 
-    headers = {"X-Auth-Token": FOOTBALL_DATA_API_KEY}
-
     async with aiohttp.ClientSession() as session:
-        async with session.get(url, headers=headers, params=params) as r:
-            data = await r.json()
-            return data.get("matches", [])
+        all_matches = []
+        for league in LEAGUES:
+            league_params = dict(params)
+            league_params["competitions"] = league
+            async with session.get(url, headers=headers, params=league_params) as r:
+                if r.status == 200:
+                    data = await r.json()
+                    all_matches.extend(data.get("matches", []))
+        return all_matches
 
-# ------------------ POST MATCHES ------------------
+# --------------- BUTTONS ----------------
+class PredictionView(discord.ui.View):
+    def __init__(self, match_id, home_team, away_team, start_time):
+        super().__init__(timeout=None)
+        self.match_id = match_id
+        self.start_time = start_time
+        self.add_item(discord.ui.Button(label=home_team, style=discord.ButtonStyle.primary, custom_id=f"{match_id}_HOME"))
+        self.add_item(discord.ui.Button(label="Draw", style=discord.ButtonStyle.secondary, custom_id=f"{match_id}_DRAW"))
+        self.add_item(discord.ui.Button(label=away_team, style=discord.ButtonStyle.danger, custom_id=f"{match_id}_AWAY"))
+
+    async def interaction_check(self, interaction: discord.Interaction):
+        now = datetime.now(timezone.utc)
+        if now >= self.start_time:
+            await interaction.response.send_message("⛔ Voting closed for this match.", ephemeral=True)
+            return False
+
+        choice = interaction.data["custom_id"].split("_")[1]
+        predictions.setdefault(self.match_id, {})[interaction.user.id] = choice
+        await interaction.response.send_message(f"✅ You predicted **{choice}**.", ephemeral=True)
+        return True
+
+# --------------- POST MATCH ---------------
 async def post_match(match):
     channel = bot.get_channel(MATCH_CHANNEL_ID)
     if not channel:
         return
 
+    match_id = match["id"]
+    if match_id in posted_matches:
+        return
+
     home = match["homeTeam"]["name"]
     away = match["awayTeam"]["name"]
-    kick_off = match["utcDate"]
+    start_time = datetime.fromisoformat(match["utcDate"].replace("Z", "+00:00"))
 
     embed = discord.Embed(
         title=f"{home} vs {away}",
-        description=f"Kick-off: {kick_off}",
-        color=discord.Color.green()
+        description=f"Kick-off: {start_time.strftime('%Y-%m-%d %H:%M UTC')}",
+        color=discord.Color.blue()
     )
-    embed.add_field(name="League", value=LEAGUES.get(match["competition"]["code"], "Unknown"))
+    embed.set_footer(text=match["competition"]["name"])
 
-    await channel.send(embed=embed)
+    view = PredictionView(match_id, home, away, start_time)
+    await channel.send(embed=embed, view=view)
 
-# ------------------ AUTO POST TASK ------------------
-@tasks.loop(minutes=10)
+    posted_matches.add(match_id)
+
+# --------------- AUTO POST TASK ---------------
+@tasks.loop(minutes=1)
 async def auto_post_matches():
     matches = await fetch_matches()
-    if not matches:
-        print("No upcoming matches to post.")
-        return
+    for match in matches:
+        await post_match(match)
 
-    now = datetime.now(timezone.utc)
+    await check_finished_matches(matches)
 
+# --------------- CHECK FINISHED MATCHES + LEADERBOARD ---------------
+async def check_finished_matches(matches):
     for match in matches:
         match_id = match["id"]
-        match_time = datetime.fromisoformat(match["utcDate"].replace("Z", "+00:00"))
+        status = match.get("status")
 
-        if match_id in posted_matches:
-            continue
-        if match_time <= now:
-            continue
+        if status == "FINISHED" and match_id in predictions:
+            home_score = match["score"]["fullTime"]["home"]
+            away_score = match["score"]["fullTime"]["away"]
 
-        await post_match(match)
-        posted_matches.add(match_id)
+            if home_score > away_score:
+                result = "HOME"
+            elif away_score > home_score:
+                result = "AWAY"
+            else:
+                result = "DRAW"
 
-# ------------------ COMMANDS ------------------
-@tree.command(name="matches", description="Show upcoming matches")
+            # Award points
+            for user_id, pred in predictions[match_id].items():
+                if pred == result:
+                    leaderboard[user_id] = leaderboard.get(user_id, 0) + 3
+
+            # Clear predictions for this match
+            del predictions[match_id]
+
+            # Post leaderboard update
+            await post_leaderboard()
+
+async def post_leaderboard():
+    channel = bot.get_channel(LEADERBOARD_CHANNEL_ID)
+    if not channel:
+        return
+
+    if not leaderboard:
+        await channel.send("Leaderboard is empty.")
+        return
+
+    sorted_lb = sorted(leaderboard.items(), key=lambda x: x[1], reverse=True)
+    lines = []
+    for rank, (user_id, points) in enumerate(sorted_lb, start=1):
+        user = await bot.fetch_user(user_id)
+        lines.append(f"**{rank}. {user.name}** — {points} pts")
+
+    embed = discord.Embed(
+        title="🏆 Leaderboard",
+        description="\n".join(lines),
+        color=discord.Color.gold()
+    )
+    await channel.send(embed=embed)
+
+# --------------- COMMANDS ---------------
+@bot.tree.command(name="matches", description="Show upcoming matches")
 async def matches_command(interaction: discord.Interaction):
-    upcoming = await fetch_matches()
-    if not upcoming:
-        await interaction.response.send_message("No upcoming matches.")
-        return
-
-    msg = ""
+    matches = await fetch_matches()
     now = datetime.now(timezone.utc)
-    for match in upcoming:
-        match_time = datetime.fromisoformat(match["utcDate"].replace("Z", "+00:00"))
-        if match_time <= now:
-            continue
-        msg += f"{match['homeTeam']['name']} vs {match['awayTeam']['name']} ({LEAGUES.get(match['competition']['code'], 'Unknown')})\n"
 
-    await interaction.response.send_message(msg or "No upcoming matches.")
+    sent = False
+    for match in matches:
+        start_time = datetime.fromisoformat(match["utcDate"].replace("Z", "+00:00"))
+        if start_time > now:
+            await post_match(match)
+            sent = True
 
-@tree.command(name="leaderboard", description="Show leaderboard")
+    if not sent:
+        await interaction.response.send_message("No upcoming matches.", ephemeral=True)
+    else:
+        await interaction.response.send_message("Upcoming matches posted.", ephemeral=True)
+
+@bot.tree.command(name="leaderboard", description="Show the current leaderboard")
 async def leaderboard_command(interaction: discord.Interaction):
-    if not scores:
-        await interaction.response.send_message("No scores yet.")
+    if not leaderboard:
+        await interaction.response.send_message("Leaderboard is empty.")
         return
 
-    sorted_scores = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-    msg = "\n".join(f"<@{user_id}>: {points}" for user_id, points in sorted_scores)
-    await interaction.response.send_message(msg)
+    sorted_lb = sorted(leaderboard.items(), key=lambda x: x[1], reverse=True)
+    lines = []
+    for rank, (user_id, points) in enumerate(sorted_lb, start=1):
+        user = await bot.fetch_user(user_id)
+        lines.append(f"**{rank}. {user.name}** — {points} pts")
 
-# ------------------ BET FUNCTION ------------------
-async def place_bet(user_id, match_id, choice, match_time):
-    now = datetime.now(timezone.utc)
-    if now >= match_time:
-        return False, "Cannot bet after match started."
+    embed = discord.Embed(
+        title="🏆 Leaderboard",
+        description="\n".join(lines),
+        color=discord.Color.gold()
+    )
+    await interaction.response.send_message(embed=embed)
 
-    user_bets = bets.setdefault(user_id, {})
-    if match_id in user_bets:
-        return False, "You already bet on this match."
-
-    user_bets[match_id] = choice
-    return True, "Bet placed successfully."
-
-# ------------------ EVENTS ------------------
+# --------------- STARTUP ---------------
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user}")
+    await bot.tree.sync()
     auto_post_matches.start()
-    try:
-        synced = await tree.sync()
-        print(f"Synced {len(synced)} commands.")
-    except Exception as e:
-        print(f"Failed to sync commands: {e}")
 
-# ------------------ RUN ------------------
-bot.run(DISCORD_BOT_TOKEN)
+bot.run(TOKEN)
