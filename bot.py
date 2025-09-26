@@ -7,7 +7,7 @@ import discord
 from discord.ext import commands, tasks
 from discord import app_commands
 from PIL import Image
-import io
+from io import BytesIO
 
 # ==== ENVIRONMENT VARIABLES ====
 DISCORD_BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN")
@@ -34,7 +34,6 @@ else:
 BASE_URL = "https://api.football-data.org/v4/competitions/"
 HEADERS = {"X-Auth-Token": FOOTBALL_DATA_API_KEY}
 COMPETITIONS = ["PL", "CL", "BL1", "DED", "PD", "FL1", "ELC", "PPL", "SA", "EC", "WC"]
-PLACEHOLDER_CREST = "https://via.placeholder.com/80x80?text=No+Logo"
 
 # ==== SAVE LEADERBOARD ====
 def save_leaderboard():
@@ -69,10 +68,12 @@ class LeaderboardResetConfirm(discord.ui.View):
         if not interaction.user.guild_permissions.administrator:
             await interaction.response.send_message("🚫 You don’t have permission.", ephemeral=True)
             return
+
         global leaderboard
         leaderboard = {}
         save_leaderboard()
         await interaction.response.send_message("✅ Leaderboard has been reset!", ephemeral=True)
+
         channel = bot.get_channel(LEADERBOARD_CHANNEL_ID)
         if channel:
             await channel.send("🔄 The leaderboard has been reset by an admin.")
@@ -105,84 +106,141 @@ async def record_prediction(interaction, match_id, prediction):
     await interaction.response.send_message(f"✅ Prediction saved: **{prediction}**", ephemeral=True)
 
 # ==== FETCH MATCHES ====
-async def fetch_matches():
+async def fetch_matches(upcoming=True):
     now = datetime.now(timezone.utc)
-    tomorrow = now + timedelta(days=1)
+    if upcoming:
+        date_from = now
+        date_to = now + timedelta(days=1)
+    else:
+        date_from = now - timedelta(days=1)
+        date_to = now
+
     matches = []
     async with aiohttp.ClientSession() as session:
         for comp in COMPETITIONS:
-            url = f"{BASE_URL}{comp}/matches?dateFrom={now.date()}&dateTo={tomorrow.date()}"
+            url = f"{BASE_URL}{comp}/matches?dateFrom={date_from.date()}&dateTo={date_to.date()}"
             async with session.get(url, headers=HEADERS) as resp:
                 if resp.status == 200:
                     data = await resp.json()
                     matches.extend(data.get("matches", []))
     return matches
 
-# ==== COMBINE CRESTS ====
-async def get_combined_crest(home_url, away_url):
-    async with aiohttp.ClientSession() as session:
-        async def fetch_image(url):
-            try:
-                async with session.get(url) as resp:
-                    if resp.status == 200:
-                        return Image.open(io.BytesIO(await resp.read())).convert("RGBA")
-            except:
-                return Image.new("RGBA", (80, 80), (200, 200, 200, 255))
-            return Image.new("RGBA", (80, 80), (200, 200, 200, 255))
-        home_img = await fetch_image(home_url or PLACEHOLDER_CREST)
-        away_img = await fetch_image(away_url or PLACEHOLDER_CREST)
-
-    target_height = 80
-    home_img.thumbnail((target_height, target_height))
-    away_img.thumbnail((target_height, target_height))
-
-    combined = Image.new("RGBA", (home_img.width + away_img.width, target_height), (255, 255, 255, 0))
-    combined.paste(home_img, (0, 0), home_img)
-    combined.paste(away_img, (home_img.width, 0), away_img)
-
-    buffer = io.BytesIO()
-    combined.save(buffer, format="PNG")
-    buffer.seek(0)
-    return buffer
-
-# ==== POST MATCHES (GROUPED BY LEAGUE) ====
-async def post_matches_grouped(matches):
+# ==== POST MATCH WITH CLUB LOGOS ====
+async def post_match(match):
     channel = bot.get_channel(MATCH_CHANNEL_ID)
     if not channel:
         return
 
-    leagues = {}
-    for match in matches:
-        comp = match.get("competition", {}).get("name", "Other")
-        leagues.setdefault(comp, []).append(match)
+    home_name = match['homeTeam']['name']
+    away_name = match['awayTeam']['name']
+    home_crest = match['homeTeam'].get('crest', None)
+    away_crest = match['awayTeam'].get('crest', None)
 
-    for league_name, league_matches in leagues.items():
-        embed = discord.Embed(title=f"🏆 {league_name} Matches", color=discord.Color.green())
-        for match in league_matches:
-            home_team = match["homeTeam"]
-            away_team = match["awayTeam"]
-            # Combined logo
-            combined_buffer = await get_combined_crest(home_team.get("crest"), away_team.get("crest"))
-            file = discord.File(fp=combined_buffer, filename="match.png")
-            embed.add_field(name=f"{home_team['name']} vs {away_team['name']}", value=f"Kickoff: {match['utcDate']}", inline=False)
-            await channel.send(file=file, embed=embed, view=MatchView(match["id"]))
+    # Prepare embed
+    embed = discord.Embed(
+        title=f"{home_name} vs {away_name}",
+        description=f"Kickoff: {match['utcDate']}",
+        color=discord.Color.blue()
+    )
 
-# ==== BACKGROUND AUTO POST ====
+    # Attempt to attach logos if available
+    if home_crest or away_crest:
+        async with aiohttp.ClientSession() as session:
+            if home_crest:
+                async with session.get(home_crest) as resp:
+                    if resp.status == 200:
+                        home_img = Image.open(BytesIO(await resp.read())).resize((64,64))
+            else:
+                home_img = Image.new("RGBA", (64,64), (255,255,255,0))
+            if away_crest:
+                async with session.get(away_crest) as resp:
+                    if resp.status == 200:
+                        away_img = Image.open(BytesIO(await resp.read())).resize((64,64))
+            else:
+                away_img = Image.new("RGBA", (64,64), (255,255,255,0))
+
+        # Merge images side by side
+        combined = Image.new("RGBA", (128,64))
+        combined.paste(home_img, (0,0))
+        combined.paste(away_img, (64,0))
+        bio = BytesIO()
+        combined.save(bio, format="PNG")
+        bio.seek(0)
+        file = discord.File(bio, filename="match.png")
+        embed.set_image(url="attachment://match.png")
+        await channel.send(embed=embed, file=file, view=MatchView(match["id"]))
+    else:
+        await channel.send(embed=embed, view=MatchView(match["id"]))
+
+# ==== AUTOMATIC POST MATCHES ====
+posted_matches = set()  # To prevent duplicates
+
 @tasks.loop(minutes=30)
 async def auto_post_matches():
-    matches = await fetch_matches()
+    matches = await fetch_matches(upcoming=True)
     if not matches:
         return
-    await post_matches_grouped(matches)
+    matches_by_league = {}
+    for match in matches:
+        match_id = match["id"]
+        if match_id in posted_matches:
+            continue
+        posted_matches.add(match_id)
+        league = match["competition"]["name"]
+        matches_by_league.setdefault(league, []).append(match)
+
+    for league, league_matches in matches_by_league.items():
+        channel = bot.get_channel(MATCH_CHANNEL_ID)
+        if channel:
+            await channel.send(f"🏆 **{league} Matches**")
+            for match in league_matches:
+                await post_match(match)
+
+# ==== UPDATE LEADERBOARD AUTOMATICALLY ====
+async def update_leaderboard():
+    finished_matches = await fetch_matches(upcoming=False)
+    for match in finished_matches:
+        if match["status"] != "FINISHED":
+            continue
+        match_id = str(match["id"])
+        home_score = match["score"]["fullTime"]["home"]
+        away_score = match["score"]["fullTime"]["away"]
+
+        if home_score > away_score:
+            result = "HOME_TEAM"
+        elif home_score < away_score:
+            result = "AWAY_TEAM"
+        else:
+            result = "DRAW"
+
+        for user_id, data in leaderboard.items():
+            if match_id in data.get("predictions", {}):
+                if data["predictions"][match_id] == result:
+                    data["points"] += 1
+    save_leaderboard()
+
+@tasks.loop(minutes=30)
+async def auto_update_leaderboard():
+    await update_leaderboard()
+    channel = bot.get_channel(LEADERBOARD_CHANNEL_ID)
+    if channel:
+        await channel.send("📊 Leaderboard updated automatically!")
 
 # ==== COMMANDS ====
 @bot.tree.command(name="matches", description="Show upcoming matches.")
 async def matches_command(interaction: discord.Interaction):
-    matches = await fetch_matches()
+    matches = await fetch_matches(upcoming=True)
     if not matches:
         await interaction.response.send_message("No upcoming matches.", ephemeral=True)
         return
-    await post_matches_grouped(matches)
+    matches_by_league = {}
+    for match in matches:
+        matches_by_league.setdefault(match["competition"]["name"], []).append(match)
+
+    for league, league_matches in matches_by_league.items():
+        await interaction.channel.send(f"🏆 **{league} Matches**")
+        for match in league_matches[:5]:
+            await post_match(match)
     await interaction.response.send_message("✅ Posted upcoming matches!", ephemeral=True)
 
 @bot.tree.command(name="leaderboard", description="Show the leaderboard.")
@@ -190,9 +248,9 @@ async def leaderboard_command(interaction: discord.Interaction):
     if not leaderboard:
         await interaction.response.send_message("Leaderboard is empty.", ephemeral=True)
         return
-
     sorted_lb = sorted(leaderboard.values(), key=lambda x: x["points"], reverse=True)
-    desc = "\n".join([f"**{i+1}. {entry['name']}** — {entry['points']} pts" for i, entry in enumerate(sorted_lb[:10])])
+    desc = "\n".join([f"**{i+1}. {entry['name']}** — {entry['points']} pts"
+                      for i, entry in enumerate(sorted_lb[:10])])
     embed = discord.Embed(title="🏆 Leaderboard", description=desc, color=discord.Color.gold())
     await interaction.response.send_message(embed=embed, view=LeaderboardView())
 
@@ -201,6 +259,7 @@ async def leaderboard_command(interaction: discord.Interaction):
 async def on_ready():
     await bot.tree.sync()
     auto_post_matches.start()
+    auto_update_leaderboard.start()
     print(f"Logged in as {bot.user}")
 
 bot.run(DISCORD_BOT_TOKEN)
