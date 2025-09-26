@@ -16,14 +16,14 @@ tree = app_commands.CommandTree(bot)
 # Environment variables
 # ----------------------
 TOKEN = os.environ.get("TOKEN")
-CHANNEL_ID = int(os.environ.get("CHANNEL_ID", 0))
+CHANNEL_ID = int(os.environ.get("CHANNEL_ID", 0))  # default channel
 API_KEY = os.environ.get("API_KEY")
 
 # ----------------------
 # Data storage
 # ----------------------
-points = {}  # user_id -> points
-user_bets = {}  # match_id -> {user_id: bet_choice}
+server_points = {}  # guild_id -> {user_id -> points}
+user_bets = {}      # match_id -> {user_id: bet_choice}
 posted_matches = set()  # match IDs already posted
 
 # ----------------------
@@ -111,14 +111,31 @@ async def matches_cmd(interaction: discord.Interaction):
         embed.set_thumbnail(url=home_logo or away_logo)
         await interaction.followup.send(embed=embed, view=BetView(m["id"]))
 
-@tree.command(name="leaderboard", description="Show top scores")
+@tree.command(name="leaderboard", description="Show top scores in this server")
 async def leaderboard(interaction: discord.Interaction):
-    if not points:
-        await interaction.response.send_message("No scores yet.")
+    guild_id = interaction.guild.id
+    points_dict = server_points.get(guild_id, {})
+
+    if not points_dict:
+        await interaction.response.send_message("No scores yet in this server. Be the first to bet! ⚽")
         return
-    sorted_points = sorted(points.items(), key=lambda x: x[1], reverse=True)
-    msg = "\n".join([f"<@{user}>: {pts}" for user, pts in sorted_points[:10]])
-    await interaction.response.send_message(f"🏆 Leaderboard 🏆\n{msg}")
+
+    # Sort top 10 users by points
+    sorted_points = sorted(points_dict.items(), key=lambda x: x[1], reverse=True)[:10]
+
+    lines = []
+    medals = ["🥇", "🥈", "🥉"]
+    for i, (user_id, pts) in enumerate(sorted_points):
+        medal = medals[i] if i < 3 else f"{i+1}."
+        lines.append(f"{medal} <@{user_id}> — **{pts} point{'s' if pts != 1 else ''}**")
+
+    embed = discord.Embed(
+        title="🏆 Server Leaderboard 🏆",
+        description="\n".join(lines),
+        color=discord.Color.gold()
+    )
+    embed.set_footer(text="Keep betting to climb the ranks!")
+    await interaction.response.send_message(embed=embed)
 
 # ----------------------
 # Auto-post upcoming matches
@@ -161,7 +178,7 @@ async def auto_post_matches():
         print(f"Posted match: {home} vs {away}")
 
 # ----------------------
-# Score finished matches
+# Score finished matches (per server)
 # ----------------------
 @tasks.loop(minutes=5)
 async def score_matches():
@@ -174,12 +191,20 @@ async def score_matches():
             continue
         match_id = m["id"]
         result = get_match_result(m)
-        if match_id in user_bets:
-            for user_id, bet in user_bets[match_id].items():
-                if bet == result:
-                    points[user_id] = points.get(user_id, 0) + 1
-            del user_bets[match_id]
-            print(f"Scored match {match_id}, updated points.")
+        if not result or match_id not in user_bets:
+            continue
+
+        # Award points per server
+        for guild_id in server_points.keys():
+            if match_id in user_bets:
+                for user_id, bet in user_bets[match_id].items():
+                    if bet == result:
+                        if guild_id not in server_points:
+                            server_points[guild_id] = {}
+                        server_points[guild_id][user_id] = server_points[guild_id].get(user_id, 0) + 1
+                del user_bets[match_id]
+
+        print(f"Scored match {match_id}, updated points.")
 
 # ----------------------
 # Bot events
