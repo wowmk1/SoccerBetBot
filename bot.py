@@ -9,13 +9,11 @@ import discord
 from discord.ext import commands, tasks
 from discord import app_commands
 
-# ==== ENVIRONMENT VARIABLES ====
 DISCORD_BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN")
 FOOTBALL_DATA_API_KEY = os.environ.get("FOOTBALL_DATA_API_KEY")
 MATCH_CHANNEL_ID = int(os.environ.get("MATCH_CHANNEL_ID"))
 LEADERBOARD_CHANNEL_ID = int(os.environ.get("LEADERBOARD_CHANNEL_ID"))
 
-# ==== BOT SETUP ====
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
 
@@ -35,7 +33,6 @@ HEADERS = {"X-Auth-Token": FOOTBALL_DATA_API_KEY}
 COMPETITIONS = ["PL", "CL", "BL1", "PD", "SA"]
 MATCH_CACHE = {}
 
-# ==== CREST COMBINER ====
 async def generate_match_image(home_url, away_url):
     async with aiohttp.ClientSession() as session:
         home_bytes = await (await session.get(home_url)).read() if home_url else None
@@ -56,11 +53,11 @@ async def generate_match_image(home_url, away_url):
     buffer.seek(0)
     return buffer
 
-# ==== MATCH BUTTONS ====
 class MatchView(discord.ui.View):
-    def __init__(self, match_id):
+    def __init__(self, match_id, message_id):
         super().__init__(timeout=None)
         self.match_id = match_id
+        self.message_id = message_id
 
     async def record_vote(self, interaction: discord.Interaction, prediction):
         user_id = str(interaction.user.id)
@@ -74,6 +71,15 @@ class MatchView(discord.ui.View):
         leaderboard[user_id]["predictions"][str(self.match_id)] = prediction
         save_leaderboard()
 
+        # React to original match message
+        try:
+            channel = interaction.channel
+            original_msg = await channel.fetch_message(self.message_id)
+            await original_msg.add_reaction("👍")
+        except:
+            pass
+
+        # Personalized button view
         view = discord.ui.View()
         for child in self.children:
             label = child.label
@@ -103,11 +109,10 @@ class MatchView(discord.ui.View):
     async def away(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self.record_vote(interaction, "AWAY_TEAM")
 
-# ==== POST MATCH ====
 async def post_match(match):
     channel = bot.get_channel(MATCH_CHANNEL_ID)
     if not channel:
-        return
+        return None
 
     home_crest = match["homeTeam"].get("crest")
     away_crest = match["awayTeam"].get("crest")
@@ -120,9 +125,10 @@ async def post_match(match):
         color=discord.Color.blue()
     )
     embed.set_image(url="attachment://match.png")
-    await channel.send(embed=embed, view=MatchView(match["id"]), file=file)
+    message = await channel.send(embed=embed, file=file)
+    await message.edit(view=MatchView(match["id"], message.id))
+    return message
 
-# ==== FETCH MATCHES ====
 async def fetch_matches():
     now = datetime.now(timezone.utc)
     tomorrow = now + timedelta(days=1)
@@ -140,7 +146,6 @@ async def fetch_matches():
                         matches.append(m)
     return matches
 
-# ==== AUTO POST MATCHES ====
 @tasks.loop(minutes=30)
 async def auto_post_matches():
     matches = await fetch_matches()
@@ -163,7 +168,6 @@ async def auto_post_matches():
         for m in league_matches:
             await post_match(m)
 
-# ==== COMMANDS ====
 @bot.tree.command(name="matches", description="Show upcoming matches.")
 async def matches_command(interaction: discord.Interaction):
     matches = await fetch_matches()
@@ -196,7 +200,6 @@ async def leaderboard_command(interaction: discord.Interaction):
     embed = discord.Embed(title="🏆 Leaderboard", description=desc, color=discord.Color.gold())
     await interaction.response.send_message(embed=embed)
 
-# ==== STARTUP ====
 @bot.event
 async def on_ready():
     await bot.tree.sync()
