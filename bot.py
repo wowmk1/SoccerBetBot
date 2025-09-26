@@ -3,7 +3,7 @@ import discord
 from discord.ext import tasks
 from discord import app_commands
 import requests
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 # ----------------------
 # Bot setup
@@ -29,9 +29,12 @@ posted_matches = set()  # match IDs already posted
 match_lookup = {}   # match_id -> match info
 
 # ----------------------
-# Fetch upcoming matches only
+# Fetch upcoming matches (today + next 3 days)
 # ----------------------
-def fetch_upcoming_matches():
+def fetch_upcoming_matches(days_ahead=3):
+    """
+    Fetch matches from today up to `days_ahead` days in the future.
+    """
     url = "https://api.football-data.org/v4/matches"
     headers = {"X-Auth-Token": API_KEY}
     try:
@@ -42,17 +45,18 @@ def fetch_upcoming_matches():
         data = resp.json()
         matches = data.get("matches", [])
 
-        # Only keep upcoming matches
         upcoming = []
-        now = datetime.utcnow().replace(tzinfo=timezone.utc)
+        now = datetime.now(timezone.utc)
+        end_date = now + timedelta(days=days_ahead)
+
         for m in matches:
             status = m.get("status")
             match_date_str = m.get("utcDate")
             match_date = datetime.fromisoformat(match_date_str.replace("Z", "+00:00"))
 
-            # Keep only matches scheduled in the future
-            if status == "SCHEDULED" and match_date > now:
+            if status == "SCHEDULED" and now <= match_date <= end_date:
                 upcoming.append(m)
+
         return upcoming
     except Exception as e:
         print("Fetch error:", e)
@@ -91,7 +95,7 @@ class BetView(discord.ui.View):
         status = match.get("status")
         match_time_str = match.get("utcDate")
         match_time = datetime.fromisoformat(match_time_str.replace("Z", "+00:00"))
-        now = datetime.utcnow().replace(tzinfo=timezone.utc)
+        now = datetime.now(timezone.utc)
 
         if status != "SCHEDULED" or match_time <= now:
             await interaction.response.send_message("❌ Betting is closed for this match!", ephemeral=True)
@@ -134,7 +138,7 @@ async def matches_cmd(interaction: discord.Interaction):
         away = m["awayTeam"]["name"]
         home_logo = m["homeTeam"].get("crest", "")
         away_logo = m["awayTeam"].get("crest", "")
-        match_lookup[m["id"]] = m  # save for betting
+        match_lookup[m["id"]] = m
 
         embed = discord.Embed(
             title=f"{home} vs {away}",
@@ -182,7 +186,7 @@ async def auto_post_matches():
         print("Channel not found.")
         return
 
-    matches = fetch_upcoming_matches()
+    matches = fetch_upcoming_matches(days_ahead=3)
     if not matches:
         print("No upcoming matches to post.")
         return
@@ -213,11 +217,11 @@ async def auto_post_matches():
 # ----------------------
 @tasks.loop(minutes=5)
 async def score_matches():
-    matches = fetch_upcoming_matches()
+    matches = fetch_upcoming_matches(days_ahead=3)
     if not matches:
         return
 
-    now = datetime.utcnow().replace(tzinfo=timezone.utc)
+    now = datetime.now(timezone.utc)
 
     for m in matches:
         if m.get("status") != "FINISHED":
