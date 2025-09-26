@@ -61,24 +61,9 @@ class MatchView(discord.ui.View):
         if user_id not in leaderboard:
             leaderboard[user_id] = {"name": interaction.user.name, "points": 0, "predictions": {}}
 
-        if str(self.match_id) in leaderboard[user_id]["predictions"]:
-            previous_vote = leaderboard[user_id]["predictions"][str(self.match_id)]
-            disabled_view = discord.ui.View()
-            for child in self.children:
-                label_key = child.label.replace(" ", "_").upper()
-                button = discord.ui.Button(
-                    label=child.label,
-                    style=self.get_button_style(user_id, label_key),
-                    disabled=True
-                )
-                disabled_view.add_item(button)
-
-            await interaction.response.send_message(
-                f"🔒 You've already voted: **{previous_vote}**",
-                ephemeral=True,
-                view=disabled_view
-            )
-            return
+        already_voted = str(self.match_id) in leaderboard[user_id]["predictions"]
+        if already_voted:
+            prediction = leaderboard[user_id]["predictions"][str(self.match_id)]
 
         self.user_votes[user_id] = prediction
         leaderboard[user_id]["predictions"][str(self.match_id)] = prediction
@@ -105,7 +90,7 @@ class MatchView(discord.ui.View):
             disabled_view.add_item(button)
 
         await interaction.response.send_message(
-            f"✅ You voted: **{prediction}**",
+            f"{'🔒 Already voted:' if already_voted else '✅ You voted:'} **{prediction}**",
             ephemeral=True,
             view=disabled_view
         )
@@ -150,6 +135,7 @@ async def post_match(match):
         color=discord.Color.blue()
     )
     embed.set_thumbnail(url=match['homeTeam'].get('crest'))
+    embed.set_image(url=match['awayTeam'].get('crest'))
     await channel.send(embed=embed, view=MatchView(match["id"]))
 
 # ==== SCORING ====
@@ -241,6 +227,7 @@ async def matches_command(interaction: discord.Interaction):
             color=discord.Color.green()
         )
         embed.set_thumbnail(url=match['homeTeam'].get('crest'))
+        embed.set_image(url=match['awayTeam'].get('crest'))
         await interaction.channel.send(embed=embed, view=MatchView(match["id"]))
 
     await interaction.response.send_message("✅ Posted upcoming matches!", ephemeral=True)
