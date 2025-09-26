@@ -57,11 +57,25 @@ async def generate_match_image(home_url, away_url, match_id):
 
     size = (100, 100)
     padding = 10
-    avatar_size = 30
+    avatar_size = 40
+    font_size = 12
 
-    # Base image for match crests
-    img_width = size[0]*2 + 40
-    img_height = size[1] + avatar_size + padding*2
+    # Load a default font
+    try:
+        font = ImageFont.truetype("arial.ttf", font_size)
+    except:
+        font = ImageFont.load_default()
+
+    # Prepare voter data
+    voter_data = [(v["avatar"], v["name"]) for uid, v in leaderboard.items() if str(match_id) in v.get("predictions", {})]
+
+    # Determine image width
+    if voter_data:
+        img_width = max(size[0]*2 + 40, len(voter_data)*(avatar_size + 10))
+    else:
+        img_width = size[0]*2 + 40
+
+    img_height = size[1] + avatar_size + padding*3 + font_size
     img = Image.new("RGBA", (img_width, img_height), (255, 255, 255, 0))
 
     # Draw home and away crests
@@ -72,18 +86,21 @@ async def generate_match_image(home_url, away_url, match_id):
         away = Image.open(BytesIO(away_img_bytes)).convert("RGBA").resize(size)
         img.paste(away, (size[0]+40, 0), away)
 
-    # Draw voter avatars below
-    voter_urls = [v["avatar"] for uid, v in leaderboard.items() if str(match_id) in v.get("predictions", {})]
+    # Draw voter avatars and usernames
     x = 0
     y = size[1] + padding
-    for i, url in enumerate(voter_urls):
+    draw = ImageDraw.Draw(img)
+    for avatar_url, name in voter_data:
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.get(url) as r:
+                async with session.get(avatar_url) as r:
                     avatar_bytes = await r.read()
             avatar = Image.open(BytesIO(avatar_bytes)).convert("RGBA").resize((avatar_size, avatar_size))
             img.paste(avatar, (x, y), avatar)
-            x += avatar_size + 5
+            # Draw username below avatar
+            text_w, text_h = draw.textsize(name, font=font)
+            draw.text((x + (avatar_size - text_w)//2, y + avatar_size), name, fill="black", font=font)
+            x += avatar_size + 10
         except: continue
 
     buffer = BytesIO()
@@ -116,12 +133,12 @@ class MatchView(discord.ui.View):
         leaderboard[user_id]["predictions"][str(self.match_id)] = prediction
         save_leaderboard()
 
-        # Regenerate image with all voter avatars
+        # Regenerate image with all voter avatars and usernames
         image_buffer = await generate_match_image(self.home_crest, self.away_crest, self.match_id)
         file = discord.File(fp=image_buffer, filename="match.png")
         embed = self.message.embeds[0]
         embed.set_image(url="attachment://match.png")
-        await self.message.edit(embed=embed)  # <-- Fixed: remove file here
+        await self.message.edit(embed=embed)  # Only edit view/embed, file cannot be reattached
 
         await interaction.response.send_message(f"✅ Prediction saved: **{prediction}**", ephemeral=True)
 
@@ -161,10 +178,9 @@ async def post_match(match):
     file = discord.File(fp=image_buffer, filename="match.png")
     embed.set_image(url="attachment://match.png")
 
-    # Send message with file and view
     msg = await channel.send(embed=embed, file=file)
     view = MatchView(match["id"], msg, home_crest, away_crest)
-    await msg.edit(view=view)  # <-- Fixed: only edit view here
+    await msg.edit(view=view)
 
 # ==== AUTO POST MATCHES ====
 @tasks.loop(minutes=30)
