@@ -1,249 +1,132 @@
+# bot.py
+import os
+import asyncio
+from datetime import datetime, timezone
 import discord
-from discord.ext import commands, tasks
-from discord import app_commands, ui
-import requests
-from datetime import datetime, timezone, timedelta
+from discord import app_commands
+from discord.ext import tasks, commands
+import aiohttp
 
 # ------------------ CONFIG ------------------
-TOKEN = "YOUR_DISCORD_BOT_TOKEN"  # Replace with your Discord bot token
-API_KEY = "YOUR_FOOTBALL_DATA_API_KEY"  # Replace with your football-data API key
+TOKEN = os.environ.get("TOKEN")
+API_KEY = os.environ.get("FOOTBALL_DATA_API_KEY")
+MATCH_CHANNEL_ID = int(os.environ.get("MATCH_CHANNEL_ID"))
+LEADERBOARD_CHANNEL_ID = int(os.environ.get("LEADERBOARD_CHANNEL_ID"))
 
-LEADERBOARD_CHANNEL_ID = 12345678990  # Replace with your leaderboard channel ID
-POST_CHANNEL_ID = 1234567890         # Replace with your match posting channel ID
+# Supported leagues
+LEAGUES = ["WC", "CL", "BL1", "DED", "PD", "FL1", "ELC", "PPL", "EC", "SA", "PL"]
 
-TRACKED_COMPETITIONS = [
-    "WC",    # FIFA World Cup
-    "CL",    # UEFA Champions League
-    "BL1",   # Bundesliga
-    "DED",   # Eredivisie
-    "PD",    # Primera Division
-    "FL1",   # Ligue 1
-    "ELC",   # Championship
-    "PPL",   # Primeira Liga
-    "EC",    # European Championship
-    "SA",    # Serie A
-    "PL"     # Premier League
-]
+intents = discord.Intents.default()
+intents.message_content = True
 
-# ------------------ GLOBALS ------------------
-bot = commands.Bot(command_prefix="!", intents=discord.Intents.all())
-tree = bot.tree
+bot = commands.Bot(command_prefix="!", intents=intents)
 
-posted_matches = set()
-match_lookup = {}       # match_id -> match info
-user_bets = {}          # match_id -> {user_id: choice}
-server_points = {}      # guild_id -> {user_id: points}
-leaderboard_message_id = None
-match_messages = {}     # match_id -> message object for countdown
+# In-memory storage for bets
+bets = {}  # {match_id: {user_id: amount}}
+match_cache = set()  # to prevent double posting
+leaderboard = {}  # {user_id: points}
 
-# ------------------ MATCH FETCHING ------------------
-def fetch_upcoming_matches():
+
+# ------------------ HELPER FUNCTIONS ------------------
+async def fetch_matches():
     url = "https://api.football-data.org/v4/matches"
     headers = {"X-Auth-Token": API_KEY}
-    today = datetime.utcnow().date()
-    tomorrow = today + timedelta(days=1)
-    params = {"dateFrom": str(today), "dateTo": str(tomorrow)}
-
-    try:
-        resp = requests.get(url, headers=headers, params=params)
-        if resp.status_code != 200:
-            print("API error:", resp.text[:500])
+    params = {
+        "dateFrom": datetime.utcnow().date(),
+        "dateTo": (datetime.utcnow().date()),
+        "status": "SCHEDULED",
+        "competitions": ",".join(LEAGUES),
+    }
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url, headers=headers, params=params) as r:
+            if r.status == 200:
+                data = await r.json()
+                return data.get("matches", [])
             return []
-        data = resp.json()
-        matches = [m for m in data.get("matches", []) if m["competition"]["code"] in TRACKED_COMPETITIONS]
-        return matches
-    except Exception as e:
-        print("Error fetching matches:", e)
-        return []
 
-# ------------------ BETTING BUTTONS ------------------
-class BetView(ui.View):
-    def __init__(self, match_id):
-        super().__init__(timeout=None)
-        self.match_id = match_id
 
-    @ui.button(label="Home Win", style=discord.ButtonStyle.green)
-    async def home_win(self, interaction: discord.Interaction, button: ui.Button):
-        await handle_bet(interaction, self.match_id, "HOME")
-
-    @ui.button(label="Draw", style=discord.ButtonStyle.gray)
-    async def draw(self, interaction: discord.Interaction, button: ui.Button):
-        await handle_bet(interaction, self.match_id, "DRAW")
-
-    @ui.button(label="Away Win", style=discord.ButtonStyle.red)
-    async def away_win(self, interaction: discord.Interaction, button: ui.Button):
-        await handle_bet(interaction, self.match_id, "AWAY")
-
-async def handle_bet(interaction, match_id, choice):
-    now = datetime.utcnow().replace(tzinfo=timezone.utc)
-    match = match_lookup.get(match_id)
-    if not match:
-        await interaction.response.send_message("Match not found.", ephemeral=True)
-        return
-
-    match_time = datetime.fromisoformat(match["utcDate"].replace("Z", "+00:00"))
-    if match_time <= now:
-        await interaction.response.send_message("Cannot bet on started or finished match.", ephemeral=True)
-        return
-
-    if match_id not in user_bets:
-        user_bets[match_id] = {}
-
-    if interaction.user.id in user_bets[match_id]:
-        await interaction.response.send_message("You already bet on this match.", ephemeral=True)
-        return
-
-    user_bets[match_id][interaction.user.id] = choice
-    await interaction.response.send_message(f"Your bet ({choice}) has been placed!", ephemeral=True)
-
-# ------------------ LEADERBOARD ------------------
-async def get_leaderboard_embed(guild_id):
-    points_dict = server_points.get(guild_id, {})
-    if not points_dict:
-        return discord.Embed(title="🏆 Server Leaderboard 🏆", description="No scores yet.", color=discord.Color.gold())
-
-    sorted_points = sorted(points_dict.items(), key=lambda x: x[1], reverse=True)[:10]
-    lines = []
-    medals = ["🥇", "🥈", "🥉"]
-    for i, (user_id, pts) in enumerate(sorted_points):
-        medal = medals[i] if i < 3 else f"{i+1}."
-        lines.append(f"{medal} <@{user_id}> — **{pts} point{'s' if pts != 1 else ''}**")
-
-    embed = discord.Embed(title="🏆 Server Leaderboard 🏆", description="\n".join(lines), color=discord.Color.gold())
-    embed.set_footer(text="Keep betting to climb the ranks! ⚽")
+def format_match_embed(match):
+    embed = discord.Embed(
+        title=f"{match['homeTeam']['name']} vs {match['awayTeam']['name']}",
+        description=f"Competition: {match['competition']['name']}\nDate: {match['utcDate']}",
+        color=discord.Color.green(),
+    )
+    embed.set_footer(text=f"Match ID: {match['id']}")
     return embed
 
-async def post_or_update_leaderboard(guild_id):
-    global leaderboard_message_id
+
+async def post_match(match):
+    channel = bot.get_channel(MATCH_CHANNEL_ID)
+    if match['id'] in match_cache:
+        return
+    embed = format_match_embed(match)
+    msg = await channel.send(embed=embed)
+    match_cache.add(match['id'])
+    return msg
+
+
+async def post_or_update_leaderboard():
     channel = bot.get_channel(LEADERBOARD_CHANNEL_ID)
-    if not channel:
+    if not leaderboard:
+        await channel.send("No scores yet!")
         return
 
-    embed = await get_leaderboard_embed(guild_id)
-    if leaderboard_message_id:
-        try:
-            msg = await channel.fetch_message(leaderboard_message_id)
-            await msg.edit(embed=embed)
-            return
-        except:
-            leaderboard_message_id = None
+    sorted_lb = sorted(leaderboard.items(), key=lambda x: x[1], reverse=True)
+    desc = "\n".join(f"<@{user_id}>: {points} pts" for user_id, points in sorted_lb)
+    embed = discord.Embed(title="Leaderboard", description=desc, color=discord.Color.gold())
+    await channel.send(embed=embed)
 
-    msg = await channel.send(embed=embed)
-    leaderboard_message_id = msg.id
-    await msg.pin()
 
-# ------------------ MATCH RESULTS ------------------
-def get_match_result(match):
-    score = match.get("score", {}).get("fullTime", {})
-    home = score.get("home", 0)
-    away = score.get("away", 0)
-    if home > away:
-        return "HOME"
-    elif home < away:
-        return "AWAY"
-    return "DRAW"
-
-async def update_match_results():
-    headers = {"X-Auth-Token": API_KEY}
-    try:
-        resp = requests.get("https://api.football-data.org/v4/matches", headers=headers)
-        data = resp.json()
-        matches = data.get("matches", [])
-        now = datetime.now(timezone.utc)
-
-        for m in matches:
-            match_id = m["id"]
-            status = m.get("status")
-            if status == "FINISHED" and match_id in user_bets:
-                bets = user_bets.pop(match_id)
-                result = get_match_result(m)
-
-                for user_id, choice in bets.items():
-                    for guild_id in server_points:
-                        if user_id not in server_points[guild_id]:
-                            server_points[guild_id][user_id] = 0
-                        if choice == result:
-                            server_points[guild_id][user_id] += 1
-                # Update leaderboard for all guilds
-                for guild_id in server_points:
-                    await post_or_update_leaderboard(guild_id)
-
-                posted_matches.discard(match_id)
-                match_lookup.pop(match_id, None)
-                match_messages.pop(match_id, None)
-
-    except Exception as e:
-        print("Error updating match results:", e)
-
-# ------------------ AUTO POST MATCHES ------------------
+# ------------------ TASKS ------------------
 @tasks.loop(minutes=5)
 async def auto_post_matches():
-    matches = fetch_upcoming_matches()
-    channel = bot.get_channel(POST_CHANNEL_ID)
-    if not channel:
-        print("Channel not found.")
+    matches = await fetch_matches()
+    for match in matches:
+        await post_match(match)
+
+
+# ------------------ COMMANDS ------------------
+@bot.command(name="matches")
+async def matches_cmd(ctx):
+    matches = await fetch_matches()
+    if not matches:
+        await ctx.send("No upcoming matches to post.")
         return
 
-    for m in matches:
-        match_id = m["id"]
-        if match_id in posted_matches:
-            continue
+    for match in matches:
+        await post_match(match)
+    await ctx.send("Matches posted!")
 
-        home = m["homeTeam"]["name"]
-        away = m["awayTeam"]["name"]
-        utc_date = m["utcDate"]
-        logo_home = m["homeTeam"].get("crest", "")
-        logo_away = m["awayTeam"].get("crest", "")
 
-        embed = discord.Embed(title=f"{home} vs {away}", description=f"Kickoff: {utc_date}", color=discord.Color.blue())
-        embed.set_thumbnail(url=logo_home)
-        embed.set_image(url=logo_away)
+@bot.command(name="leaderboard")
+async def leaderboard_cmd(ctx):
+    await post_or_update_leaderboard()
 
-        msg = await channel.send(embed=embed, view=BetView(match_id))
-        posted_matches.add(match_id)
-        match_lookup[match_id] = m
-        match_messages[match_id] = msg
 
-# ------------------ COUNTDOWN UPDATES ------------------
-@tasks.loop(minutes=1)
-async def update_match_countdowns():
+@bot.command(name="bet")
+async def bet_cmd(ctx, match_id: int, amount: int):
     now = datetime.utcnow().replace(tzinfo=timezone.utc)
-    for match_id, msg in list(match_messages.items()):
-        match = match_lookup.get(match_id)
-        if not match:
-            continue
+    matches = await fetch_matches()
+    match = next((m for m in matches if m['id'] == match_id), None)
+    if not match:
+        await ctx.send("Match not found or already started/finished.")
+        return
 
-        match_time = datetime.fromisoformat(match["utcDate"].replace("Z", "+00:00"))
-        delta = match_time - now
-        if delta.total_seconds() <= 0:
-            continue
+    user_bets = bets.setdefault(match_id, {})
+    if ctx.author.id in user_bets:
+        await ctx.send("You have already placed a bet on this match.")
+        return
 
-        hours, remainder = divmod(int(delta.total_seconds()), 3600)
-        minutes, _ = divmod(remainder, 60)
-        home = match["homeTeam"]["name"]
-        away = match["awayTeam"]["name"]
+    user_bets[ctx.author.id] = amount
+    await ctx.send(f"Bet of {amount} points placed on match {match['homeTeam']['name']} vs {match['awayTeam']['name']}.")
 
-        embed = discord.Embed(
-            title=f"{home} vs {away}",
-            description=f"Kickoff in {hours}h {minutes}m",
-            color=discord.Color.blue()
-        )
-        await msg.edit(embed=embed, view=BetView(match_id))
 
-# ------------------ BOT COMMANDS ------------------
+# ------------------ EVENTS ------------------
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user}")
     auto_post_matches.start()
-    update_match_countdowns.start()
-    await update_match_results()
 
-# Slash commands
-@tree.command(name="leaderboard", description="Show server leaderboard")
-async def leaderboard_cmd(interaction: discord.Interaction):
-    await post_or_update_leaderboard(interaction.guild.id)
-    await interaction.response.send_message("Leaderboard updated!", ephemeral=True)
 
 # ------------------ RUN BOT ------------------
 bot.run(TOKEN)
-
