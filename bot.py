@@ -2,11 +2,12 @@ import os
 import json
 import aiohttp
 from datetime import datetime, timezone, timedelta
+from io import BytesIO
+from PIL import Image
 import discord
 from discord.ext import commands, tasks
-from discord import app_commands
 
-# ==== ENVIRONMENT VARIABLES ====
+# ==== ENV VARIABLES ====
 DISCORD_BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN")
 FOOTBALL_DATA_API_KEY = os.environ.get("FOOTBALL_DATA_API_KEY")
 MATCH_CHANNEL_ID = int(os.environ.get("MATCH_CHANNEL_ID"))
@@ -21,7 +22,7 @@ intents.message_content = True
 intents.reactions = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# Leaderboard persistence
+# ==== LEADERBOARD ====
 LEADERBOARD_FILE = "leaderboard.json"
 if os.path.exists(LEADERBOARD_FILE):
     with open(LEADERBOARD_FILE, "r") as f:
@@ -29,17 +30,14 @@ if os.path.exists(LEADERBOARD_FILE):
 else:
     leaderboard = {}
 
-# ==== FOOTBALL API ====
-BASE_URL = "https://api.football-data.org/v4/competitions/"
-HEADERS = {"X-Auth-Token": FOOTBALL_DATA_API_KEY}
-
-# Only include desired leagues
-COMPETITIONS = ["PL", "CL", "BL1", "PD", "FL1", "SA", "EC", "WC"]
-
-# ==== SAVE LEADERBOARD ====
 def save_leaderboard():
     with open(LEADERBOARD_FILE, "w") as f:
         json.dump(leaderboard, f)
+
+# ==== FOOTBALL API ====
+BASE_URL = "https://api.football-data.org/v4/competitions/"
+HEADERS = {"X-Auth-Token": FOOTBALL_DATA_API_KEY}
+COMPETITIONS = ["PL", "CL", "BL1", "PD", "FL1", "SA", "EC", "WC"]  # excluded DED, ELC, PPL
 
 # ==== VOTE EMOJIS ====
 VOTE_EMOJIS = {
@@ -48,9 +46,54 @@ VOTE_EMOJIS = {
     "🛫": "AWAY_TEAM"
 }
 
+# ==== MATCH IMAGE ====
+async def generate_match_image(home_url, away_url):
+    async with aiohttp.ClientSession() as session:
+        home_img_bytes, away_img_bytes = None, None
+        try:
+            if home_url:
+                async with session.get(home_url) as r:
+                    home_img_bytes = await r.read()
+        except: pass
+        try:
+            if away_url:
+                async with session.get(away_url) as r:
+                    away_img_bytes = await r.read()
+        except: pass
+
+    size = (100, 100)
+    img = Image.new("RGBA", (size[0]*2 + 40, size[1]), (255, 255, 255, 0))
+    if home_img_bytes:
+        home = Image.open(BytesIO(home_img_bytes)).convert("RGBA").resize(size)
+        img.paste(home, (0, 0), home)
+    if away_img_bytes:
+        away = Image.open(BytesIO(away_img_bytes)).convert("RGBA").resize(size)
+        img.paste(away, (size[0]+40, 0), away)
+
+    buffer = BytesIO()
+    img.save(buffer, format="PNG")
+    buffer.seek(0)
+    return buffer
+
+# ==== FETCH MATCHES ====
+async def fetch_matches():
+    now = datetime.now(timezone.utc)
+    tomorrow = now + timedelta(days=1)
+    matches = []
+
+    async with aiohttp.ClientSession() as session:
+        for comp in COMPETITIONS:
+            url = f"{BASE_URL}{comp}/matches?dateFrom={now.date()}&dateTo={tomorrow.date()}"
+            async with session.get(url, headers=HEADERS) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    for m in data.get("matches", []):
+                        m["competition"]["name"] = data.get("competition", {}).get("name", comp)
+                        matches.append(m)
+    return [m for m in matches if datetime.fromisoformat(m['utcDate'].replace("Z", "+00:00")) > datetime.now(timezone.utc)]
+
 # ==== POST MATCH ====
 async def post_match(match):
-    # Skip past matches
     match_time = datetime.fromisoformat(match['utcDate'].replace("Z", "+00:00"))
     if match_time < datetime.now(timezone.utc):
         return
@@ -72,66 +115,62 @@ async def post_match(match):
         color=discord.Color.blue()
     )
 
-    msg = await channel.send(embed=embed)
+    home_crest = match["homeTeam"].get("crest")
+    away_crest = match["awayTeam"].get("crest")
+    file = None
+    if home_crest or away_crest:
+        image_buffer = await generate_match_image(home_crest, away_crest)
+        file = discord.File(fp=image_buffer, filename="match.png")
+        embed.set_image(url="attachment://match.png")
 
-    # Add reaction options
+    msg = await channel.send(embed=embed, file=file)
+
+    # Store kickoff time
+    if not hasattr(bot, "match_times"):
+        bot.match_times = {}
+    bot.match_times[str(msg.id)] = match_time
+
+    # Add vote reactions
     for emoji in VOTE_EMOJIS:
         await msg.add_reaction(emoji)
 
-# ==== FETCH MATCHES ====
-async def fetch_matches():
-    now = datetime.now(timezone.utc)
-    tomorrow = now + timedelta(days=1)
-    matches = []
-
-    async with aiohttp.ClientSession() as session:
-        for comp in COMPETITIONS:
-            url = f"{BASE_URL}{comp}/matches?dateFrom={now.date()}&dateTo={tomorrow.date()}"
-            async with session.get(url, headers=HEADERS) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    for m in data.get("matches", []):
-                        m["competition"]["name"] = data.get("competition", {}).get("name", comp)
-                        matches.append(m)
-
-    upcoming = [m for m in matches if datetime.fromisoformat(m['utcDate'].replace("Z", "+00:00")) > datetime.now(timezone.utc)]
-    return upcoming
-
-# ==== AUTO POST MATCHES ====
-@tasks.loop(minutes=30)
-async def auto_post_matches():
-    matches = await fetch_matches()
-    for m in matches:
-        await post_match(m)
-
-# ==== REACTION HANDLING ====
+# ==== REACTION HANDLER ====
 @bot.event
 async def on_raw_reaction_add(payload):
     if payload.user_id == bot.user.id:
         return
 
-    if str(payload.emoji) not in VOTE_EMOJIS:
-        return
-
     channel = bot.get_channel(payload.channel_id)
     message = await channel.fetch_message(payload.message_id)
-    match_id = str(message.id)  # Using message ID as match ID
+    match_id = str(message.id)
+
+    # Remove any invalid reactions immediately
+    if str(payload.emoji) not in VOTE_EMOJIS:
+        user = await bot.fetch_user(payload.user_id)
+        async for react in message.reactions:
+            if react.emoji == str(payload.emoji):
+                async for u in react.users():
+                    if u.id == payload.user_id:
+                        await react.remove(u)
+        return
+
+    # Check match time
+    match_time = bot.match_times.get(match_id)
+    if not match_time or match_time < datetime.now(timezone.utc):
+        return  # Match started/finished
 
     user_id = str(payload.user_id)
     user = await bot.fetch_user(payload.user_id)
-
-    # Initialize user in leaderboard
     if user_id not in leaderboard:
         leaderboard[user_id] = {"name": user.name, "points": 0, "predictions": {}}
 
-    # Remove other votes if user already voted
+    # Enforce one vote per user
     for react in message.reactions:
         if str(react.emoji) != str(payload.emoji):
             async for u in react.users():
                 if u.id == payload.user_id:
                     await react.remove(u)
 
-    # Save vote
     leaderboard[user_id]["predictions"][match_id] = VOTE_EMOJIS[str(payload.emoji)]
     save_leaderboard()
 
@@ -142,8 +181,32 @@ async def on_raw_reaction_add(payload):
     embed.description = f"Kickoff: {kickoff_line}"
     if voter_names:
         embed.description += "\n\n**Voted:** " + ", ".join(voter_names)
-
     await message.edit(embed=embed)
+
+# ==== CHECK FINISHED MATCHES & AWARD POINTS ====
+@tasks.loop(minutes=5)
+async def update_match_results():
+    async with aiohttp.ClientSession() as session:
+        for comp in COMPETITIONS:
+            url = f"{BASE_URL}{comp}/matches"
+            async with session.get(url, headers=HEADERS) as resp:
+                if resp.status != 200:
+                    continue
+                data = await resp.json()
+                for m in data.get("matches", []):
+                    match_id = str(m["id"])
+                    status = m.get("status")
+                    if status != "FINISHED":
+                        continue
+                    result = m.get("score", {}).get("winner")  # HOME_TEAM, DRAW, AWAY_TEAM
+                    if not result:
+                        continue
+
+                    # Award points
+                    for uid, v in leaderboard.items():
+                        if v.get("predictions", {}).get(match_id) == result:
+                            v["points"] = v.get("points", 0) + 1
+                    save_leaderboard()
 
 # ==== COMMANDS ====
 @bot.tree.command(name="matches", description="Show upcoming matches.")
@@ -162,11 +225,9 @@ async def leaderboard_command(interaction: discord.Interaction):
     if not users:
         await interaction.response.send_message("Leaderboard is empty.", ephemeral=True)
         return
-
     sorted_lb = sorted(users, key=lambda x: (-x.get("points", 0), x["name"].lower()))
     desc = "\n".join([f"**{i+1}. {entry['name']}** — {entry['points']} pts"
                       for i, entry in enumerate(sorted_lb[:10])])
-
     embed = discord.Embed(title="🏆 Leaderboard", description=desc, color=discord.Color.gold())
     await interaction.response.send_message(embed=embed)
 
@@ -175,6 +236,14 @@ async def leaderboard_command(interaction: discord.Interaction):
 async def on_ready():
     await bot.tree.sync()
     auto_post_matches.start()
+    update_match_results.start()
     print(f"Logged in as {bot.user}")
+
+# ==== AUTO POST MATCHES ====
+@tasks.loop(minutes=30)
+async def auto_post_matches():
+    matches = await fetch_matches()
+    for m in matches:
+        await post_match(m)
 
 bot.run(DISCORD_BOT_TOKEN)
