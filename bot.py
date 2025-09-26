@@ -1,10 +1,7 @@
 import os
 import json
 import aiohttp
-import asyncio
 from datetime import datetime, timezone, timedelta
-from io import BytesIO
-from PIL import Image, ImageDraw, ImageFont
 import discord
 from discord.ext import commands, tasks
 from discord import app_commands
@@ -20,6 +17,8 @@ if not all([DISCORD_BOT_TOKEN, FOOTBALL_DATA_API_KEY, MATCH_CHANNEL_ID, LEADERBO
 
 # ==== BOT SETUP ====
 intents = discord.Intents.default()
+intents.message_content = True
+intents.reactions = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # Leaderboard persistence
@@ -35,128 +34,23 @@ BASE_URL = "https://api.football-data.org/v4/competitions/"
 HEADERS = {"X-Auth-Token": FOOTBALL_DATA_API_KEY}
 
 # Only include desired leagues
-COMPETITIONS = ["PL", "CL", "BL1", "PD", "FL1", "SA", "EC", "WC"]  # Excluded DED, ELC, PPL
+COMPETITIONS = ["PL", "CL", "BL1", "PD", "FL1", "SA", "EC", "WC"]
 
 # ==== SAVE LEADERBOARD ====
 def save_leaderboard():
     with open(LEADERBOARD_FILE, "w") as f:
         json.dump(leaderboard, f)
 
-# ==== GENERATE MATCH IMAGE WITH CRESTS AND VOTERS ====
-async def generate_match_image(home_url, away_url, match_id):
-    async with aiohttp.ClientSession() as session:
-        home_img_bytes, away_img_bytes = None, None
-        try:
-            async with session.get(home_url) as r:
-                home_img_bytes = await r.read()
-        except: pass
-        try:
-            async with session.get(away_url) as r:
-                away_img_bytes = await r.read()
-        except: pass
-
-    size = (100, 100)
-    padding = 10
-    avatar_size = 40
-    font_size = 12
-
-    # Load a default font
-    try:
-        font = ImageFont.truetype("arial.ttf", font_size)
-    except:
-        font = ImageFont.load_default()
-
-    # Prepare voter data
-    voter_data = [(v["avatar"], v["name"]) for uid, v in leaderboard.items() if str(match_id) in v.get("predictions", {})]
-
-    # Determine image width
-    if voter_data:
-        img_width = max(size[0]*2 + 40, len(voter_data)*(avatar_size + 10))
-    else:
-        img_width = size[0]*2 + 40
-
-    img_height = size[1] + avatar_size + padding*3 + font_size
-    img = Image.new("RGBA", (img_width, img_height), (255, 255, 255, 0))
-
-    # Draw home and away crests
-    if home_img_bytes:
-        home = Image.open(BytesIO(home_img_bytes)).convert("RGBA").resize(size)
-        img.paste(home, (0, 0), home)
-    if away_img_bytes:
-        away = Image.open(BytesIO(away_img_bytes)).convert("RGBA").resize(size)
-        img.paste(away, (size[0]+40, 0), away)
-
-    # Draw voter avatars and usernames
-    x = 0
-    y = size[1] + padding
-    draw = ImageDraw.Draw(img)
-    for avatar_url, name in voter_data:
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(avatar_url) as r:
-                    avatar_bytes = await r.read()
-            avatar = Image.open(BytesIO(avatar_bytes)).convert("RGBA").resize((avatar_size, avatar_size))
-            img.paste(avatar, (x, y), avatar)
-            # Draw username below avatar
-            text_w, text_h = draw.textsize(name, font=font)
-            draw.text((x + (avatar_size - text_w)//2, y + avatar_size), name, fill="black", font=font)
-            x += avatar_size + 10
-        except: continue
-
-    buffer = BytesIO()
-    img.save(buffer, format="PNG")
-    buffer.seek(0)
-    return buffer
-
-# ==== MATCH BUTTONS ====
-class MatchView(discord.ui.View):
-    def __init__(self, match_id, message: discord.Message, home_crest, away_crest):
-        super().__init__(timeout=None)
-        self.match_id = match_id
-        self.message = message
-        self.home_crest = home_crest
-        self.away_crest = away_crest
-
-    async def record_vote(self, interaction: discord.Interaction, prediction):
-        user_id = str(interaction.user.id)
-
-        # One vote per user per match
-        if user_id in leaderboard and str(self.match_id) in leaderboard[user_id].get("predictions", {}):
-            await interaction.response.send_message("❌ You already voted for this match.", ephemeral=True)
-            return
-
-        # Save vote
-        if user_id not in leaderboard:
-            leaderboard[user_id] = {"name": interaction.user.name, "points": 0, "predictions": {}, "avatar": interaction.user.display_avatar.url}
-        else:
-            leaderboard[user_id]["avatar"] = interaction.user.display_avatar.url
-        leaderboard[user_id]["predictions"][str(self.match_id)] = prediction
-        save_leaderboard()
-
-        # Regenerate image with all voter avatars and usernames
-        image_buffer = await generate_match_image(self.home_crest, self.away_crest, self.match_id)
-        file = discord.File(fp=image_buffer, filename="match.png")
-        embed = self.message.embeds[0]
-        embed.set_image(url="attachment://match.png")
-        await self.message.edit(embed=embed)  # Only edit view/embed, file cannot be reattached
-
-        await interaction.response.send_message(f"✅ Prediction saved: **{prediction}**", ephemeral=True)
-
-    @discord.ui.button(label="Home Win", style=discord.ButtonStyle.primary)
-    async def home(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self.record_vote(interaction, "HOME_TEAM")
-
-    @discord.ui.button(label="Draw", style=discord.ButtonStyle.secondary)
-    async def draw(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self.record_vote(interaction, "DRAW")
-
-    @discord.ui.button(label="Away Win", style=discord.ButtonStyle.danger)
-    async def away(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self.record_vote(interaction, "AWAY_TEAM")
+# ==== VOTE EMOJIS ====
+VOTE_EMOJIS = {
+    "🏠": "HOME_TEAM",
+    "⚖️": "DRAW",
+    "🛫": "AWAY_TEAM"
+}
 
 # ==== POST MATCH ====
 async def post_match(match):
-    # Skip finished/past games
+    # Skip past matches
     match_time = datetime.fromisoformat(match['utcDate'].replace("Z", "+00:00"))
     if match_time < datetime.now(timezone.utc):
         return
@@ -165,31 +59,24 @@ async def post_match(match):
     if not channel:
         return
 
-    home_crest = match["homeTeam"].get("crest")
-    away_crest = match["awayTeam"].get("crest")
+    match_id = str(match["id"])
+    voter_names = [v["name"] for uid, v in leaderboard.items() if match_id in v.get("predictions", {})]
+
+    embed_desc = f"Kickoff: {match['utcDate']}"
+    if voter_names:
+        embed_desc += "\n\n**Voted:** " + ", ".join(voter_names)
 
     embed = discord.Embed(
         title=f"{match['homeTeam']['name']} vs {match['awayTeam']['name']}",
-        description=f"Kickoff: {match['utcDate']}",
+        description=embed_desc,
         color=discord.Color.blue()
     )
 
-    image_buffer = await generate_match_image(home_crest, away_crest, match["id"])
-    file = discord.File(fp=image_buffer, filename="match.png")
-    embed.set_image(url="attachment://match.png")
+    msg = await channel.send(embed=embed)
 
-    msg = await channel.send(embed=embed, file=file)
-    view = MatchView(match["id"], msg, home_crest, away_crest)
-    await msg.edit(view=view)
-
-# ==== AUTO POST MATCHES ====
-@tasks.loop(minutes=30)
-async def auto_post_matches():
-    matches = await fetch_matches()
-    if not matches:
-        return
-    for m in matches:
-        await post_match(m)
+    # Add reaction options
+    for emoji in VOTE_EMOJIS:
+        await msg.add_reaction(emoji)
 
 # ==== FETCH MATCHES ====
 async def fetch_matches():
@@ -206,9 +93,57 @@ async def fetch_matches():
                     for m in data.get("matches", []):
                         m["competition"]["name"] = data.get("competition", {}).get("name", comp)
                         matches.append(m)
-    # Filter only upcoming matches
+
     upcoming = [m for m in matches if datetime.fromisoformat(m['utcDate'].replace("Z", "+00:00")) > datetime.now(timezone.utc)]
     return upcoming
+
+# ==== AUTO POST MATCHES ====
+@tasks.loop(minutes=30)
+async def auto_post_matches():
+    matches = await fetch_matches()
+    for m in matches:
+        await post_match(m)
+
+# ==== REACTION HANDLING ====
+@bot.event
+async def on_raw_reaction_add(payload):
+    if payload.user_id == bot.user.id:
+        return
+
+    if str(payload.emoji) not in VOTE_EMOJIS:
+        return
+
+    channel = bot.get_channel(payload.channel_id)
+    message = await channel.fetch_message(payload.message_id)
+    match_id = str(message.id)  # Using message ID as match ID
+
+    user_id = str(payload.user_id)
+    user = await bot.fetch_user(payload.user_id)
+
+    # Initialize user in leaderboard
+    if user_id not in leaderboard:
+        leaderboard[user_id] = {"name": user.name, "points": 0, "predictions": {}}
+
+    # Remove other votes if user already voted
+    for react in message.reactions:
+        if str(react.emoji) != str(payload.emoji):
+            async for u in react.users():
+                if u.id == payload.user_id:
+                    await react.remove(u)
+
+    # Save vote
+    leaderboard[user_id]["predictions"][match_id] = VOTE_EMOJIS[str(payload.emoji)]
+    save_leaderboard()
+
+    # Update embed with voter names
+    voter_names = [v["name"] for uid, v in leaderboard.items() if match_id in v.get("predictions", {})]
+    embed = message.embeds[0]
+    kickoff_line = embed.description.split("Kickoff:")[1].splitlines()[0]
+    embed.description = f"Kickoff: {kickoff_line}"
+    if voter_names:
+        embed.description += "\n\n**Voted:** " + ", ".join(voter_names)
+
+    await message.edit(embed=embed)
 
 # ==== COMMANDS ====
 @bot.tree.command(name="matches", description="Show upcoming matches.")
