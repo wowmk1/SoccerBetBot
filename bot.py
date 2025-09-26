@@ -5,11 +5,25 @@ import requests
 from datetime import datetime, timezone, timedelta
 
 # ------------------ CONFIG ------------------
-TOKEN = "YOUR_DISCORD_BOT_TOKEN"
-API_KEY = "YOUR_FOOTBALL_DATA_API_KEY"
-LEADERBOARD_CHANNEL_ID = YOUR_CHANNEL_ID  # Channel for leaderboard
-POST_CHANNEL_ID = YOUR_CHANNEL_ID         # Channel to post matches
-TRACKED_COMPETITIONS = ["PL", "PD", "SA", "CL", "EL", "WC"]  # League codes
+TOKEN = "YOUR_DISCORD_BOT_TOKEN"  # Replace with your Discord bot token
+API_KEY = "YOUR_FOOTBALL_DATA_API_KEY"  # Replace with your football-data API key
+
+LEADERBOARD_CHANNEL_ID = 1421221580159320084  # Replace with your leaderboard channel ID
+POST_CHANNEL_ID = 1421208643558179009         # Replace with your match posting channel ID
+
+TRACKED_COMPETITIONS = [
+    "WC",    # FIFA World Cup
+    "CL",    # UEFA Champions League
+    "BL1",   # Bundesliga
+    "DED",   # Eredivisie
+    "PD",    # Primera Division
+    "FL1",   # Ligue 1
+    "ELC",   # Championship
+    "PPL",   # Primeira Liga
+    "EC",    # European Championship
+    "SA",    # Serie A
+    "PL"     # Premier League
+]
 
 # ------------------ GLOBALS ------------------
 bot = commands.Bot(command_prefix="!", intents=discord.Intents.all())
@@ -214,30 +228,21 @@ async def update_match_countdowns():
             description=f"Kickoff in {hours}h {minutes}m",
             color=discord.Color.blue()
         )
-        logo_home = match["homeTeam"].get("crest", "")
-        logo_away = match["awayTeam"].get("crest", "")
-        embed.set_thumbnail(url=logo_home)
-        embed.set_image(url=logo_away)
+        await msg.edit(embed=embed, view=BetView(match_id))
 
-        try:
-            await msg.edit(embed=embed)
-        except:
-            continue
-
-# ------------------ BOT EVENTS ------------------
+# ------------------ BOT COMMANDS ------------------
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user}")
-    await tree.sync()
     auto_post_matches.start()
-    auto_update_results.start()
     update_match_countdowns.start()
+    await update_match_results()
 
-# ------------------ SLASH COMMANDS ------------------
+# Slash commands
 @tree.command(name="leaderboard", description="Show server leaderboard")
 async def leaderboard_cmd(interaction: discord.Interaction):
-    embed = await get_leaderboard_embed(interaction.guild.id)
-    await interaction.response.send_message(embed=embed)
+    await post_or_update_leaderboard(interaction.guild.id)
+    await interaction.response.send_message("Leaderboard updated!", ephemeral=True)
 
 # ------------------ RUN BOT ------------------
 bot.run(TOKEN)
