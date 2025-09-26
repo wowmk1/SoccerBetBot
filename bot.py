@@ -28,33 +28,23 @@ if os.path.exists(LEADERBOARD_FILE):
 else:
     leaderboard = {}
 
-# ==== POSTED MATCHES TRACKING ====
-POSTED_MATCHES_FILE = "posted_matches.json"
-if os.path.exists(POSTED_MATCHES_FILE):
-    with open(POSTED_MATCHES_FILE, "r") as f:
-        posted_matches = set(json.load(f))
-else:
-    posted_matches = set()
-
 def save_leaderboard():
     with open(LEADERBOARD_FILE, "w") as f:
         json.dump(leaderboard, f)
-
-def save_posted_matches():
-    with open(POSTED_MATCHES_FILE, "w") as f:
-        json.dump(list(posted_matches), f)
 
 # ==== FOOTBALL API ====
 BASE_URL = "https://api.football-data.org/v4/competitions/"
 HEADERS = {"X-Auth-Token": FOOTBALL_DATA_API_KEY}
 COMPETITIONS = ["PL", "CL", "BL1", "DED", "PD", "FL1", "ELC", "PPL", "SA", "EC", "WC"]
 
-# ==== CLUB ICONS ====
+# ==== CLUB ICONS (example, extend as needed) ====
 CLUB_ICONS = {
-    # Example: "Manchester United": "https://link_to_icon.png"
+    "Manchester United": "https://upload.wikimedia.org/wikipedia/en/7/7a/Manchester_United_FC_crest.svg",
+    "Liverpool": "https://upload.wikimedia.org/wikipedia/en/0/0c/Liverpool_FC.svg",
+    "Chelsea": "https://upload.wikimedia.org/wikipedia/en/c/cc/Chelsea_FC.svg",
+    # add more clubs here
 }
-
-PLACEHOLDER_ICON = "https://via.placeholder.com/64.png?text=?"
+PLACEHOLDER_ICON = "https://upload.wikimedia.org/wikipedia/commons/1/14/No_Image_Available.jpg"
 
 # ==== MATCH BUTTONS ====
 class MatchView(discord.ui.View):
@@ -62,30 +52,19 @@ class MatchView(discord.ui.View):
         super().__init__(timeout=None)
         self.match_id = match_id
 
-    async def record(self, interaction, prediction):
-        user_id = str(interaction.user.id)
-        if user_id not in leaderboard:
-            leaderboard[user_id] = {"name": interaction.user.name, "points": 0, "predictions": {}}
-        leaderboard[user_id]["predictions"][str(self.match_id)] = {
-            "choice": prediction,
-            "avatar": str(interaction.user.display_avatar.url)
-        }
-        save_leaderboard()
-        await interaction.response.send_message(f"✅ Prediction saved: **{prediction}**", ephemeral=True)
-
     @discord.ui.button(label="Home Win", style=discord.ButtonStyle.primary)
     async def home(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self.record(interaction, "HOME_TEAM")
+        await record_prediction(interaction, self.match_id, "HOME_TEAM")
 
     @discord.ui.button(label="Draw", style=discord.ButtonStyle.secondary)
     async def draw(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self.record(interaction, "DRAW")
+        await record_prediction(interaction, self.match_id, "DRAW")
 
     @discord.ui.button(label="Away Win", style=discord.ButtonStyle.danger)
     async def away(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self.record(interaction, "AWAY_TEAM")
+        await record_prediction(interaction, self.match_id, "AWAY_TEAM")
 
-# ==== LEADERBOARD RESET ====
+# ==== LEADERBOARD RESET BUTTON ====
 class LeaderboardResetConfirm(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=30)
@@ -118,8 +97,19 @@ class LeaderboardView(discord.ui.View):
         if not interaction.user.guild_permissions.administrator:
             await interaction.response.send_message("🚫 You don’t have permission.", ephemeral=True)
             return
-        await interaction.response.send_message("⚠️ Are you sure you want to reset the leaderboard?", 
-                                                view=LeaderboardResetConfirm(), ephemeral=True)
+        await interaction.response.send_message(
+            "⚠️ Are you sure you want to reset the leaderboard?", 
+            view=LeaderboardResetConfirm(), ephemeral=True
+        )
+
+# ==== RECORD PREDICTIONS ====
+async def record_prediction(interaction, match_id, prediction):
+    user_id = str(interaction.user.id)
+    if user_id not in leaderboard:
+        leaderboard[user_id] = {"name": interaction.user.name, "points": 0, "predictions": {}}
+    leaderboard[user_id]["predictions"][str(match_id)] = prediction
+    save_leaderboard()
+    await interaction.response.send_message(f"✅ Prediction saved: **{prediction}**", ephemeral=True)
 
 # ==== FETCH MATCHES ====
 async def fetch_matches():
@@ -138,9 +128,6 @@ async def fetch_matches():
 
 # ==== POST MATCH ====
 async def post_match(match):
-    if match["id"] in posted_matches:
-        return  # skip already posted
-
     channel = bot.get_channel(MATCH_CHANNEL_ID)
     if not channel:
         return
@@ -155,10 +142,7 @@ async def post_match(match):
     )
     embed.set_thumbnail(url=home_icon)
     embed.set_image(url=away_icon)
-
     await channel.send(embed=embed, view=MatchView(match["id"]))
-    posted_matches.add(match["id"])
-    save_posted_matches()
 
 # ==== BACKGROUND AUTO POST ====
 @tasks.loop(minutes=30)
@@ -172,9 +156,10 @@ async def auto_post_matches():
 # ==== COMMANDS ====
 @bot.tree.command(name="matches", description="Show upcoming matches.")
 async def matches_command(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
     matches = await fetch_matches()
     if not matches:
-        await interaction.response.send_message("No upcoming matches.", ephemeral=True)
+        await interaction.followup.send("No upcoming matches.", ephemeral=True)
         return
 
     for match in matches[:5]:
@@ -188,8 +173,9 @@ async def matches_command(interaction: discord.Interaction):
         )
         embed.set_thumbnail(url=home_icon)
         embed.set_image(url=away_icon)
-        await interaction.channel.send(embed=embed, view=MatchView(match["id"]))
-    await interaction.response.send_message("✅ Posted upcoming matches!", ephemeral=True)
+        await interaction.followup.send(embed=embed, view=MatchView(match["id"]))
+
+    await interaction.followup.send("✅ Posted upcoming matches!", ephemeral=True)
 
 @bot.tree.command(name="leaderboard", description="Show the leaderboard.")
 async def leaderboard_command(interaction: discord.Interaction):
