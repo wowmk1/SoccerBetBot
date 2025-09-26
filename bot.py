@@ -2,6 +2,9 @@ import os
 import json
 import aiohttp
 import asyncio
+import requests
+from io import BytesIO
+from PIL import Image
 from datetime import datetime, timezone, timedelta
 import discord
 from discord.ext import commands, tasks
@@ -38,6 +41,22 @@ COMPETITIONS = ["PL", "CL", "BL1", "DED", "PD", "FL1", "ELC", "PPL", "SA", "EC",
 
 MATCH_CACHE = {}
 VOTE_TRACKER = {}
+
+# ==== CREST COMBINER ====
+def combine_crests(home_url, away_url, output_path="combined.png", size=(128, 128)):
+    try:
+        home_img = Image.open(BytesIO(requests.get(home_url).content)).convert("RGBA")
+        away_img = Image.open(BytesIO(requests.get(away_url).content)).convert("RGBA")
+        home_img = home_img.resize(size, Image.LANCZOS)
+        away_img = away_img.resize(size, Image.LANCZOS)
+        combined = Image.new("RGBA", (size[0]*2, size[1]), (255, 255, 255, 0))
+        combined.paste(home_img, (0, 0))
+        combined.paste(away_img, (size[0], 0))
+        combined.save(output_path)
+        return output_path
+    except Exception as e:
+        print(f"Error combining crests: {e}")
+        return None
 
 # ==== MATCH BUTTONS ====
 class MatchView(discord.ui.View):
@@ -134,9 +153,15 @@ async def post_match(match):
         description=f"Kickoff: {match['utcDate']}",
         color=discord.Color.blue()
     )
-    embed.set_thumbnail(url=match['homeTeam'].get('crest'))
-    embed.set_image(url=match['awayTeam'].get('crest'))
-    await channel.send(embed=embed, view=MatchView(match["id"]))
+    crest_path = combine_crests(match['homeTeam'].get('crest'), match['awayTeam'].get('crest'))
+    if crest_path:
+        file = discord.File(crest_path, filename="crests.png")
+        embed.set_image(url="attachment://crests.png")
+        await channel.send(embed=embed, view=MatchView(match["id"]), file=file)
+    else:
+        embed.set_thumbnail(url=match['homeTeam'].get('crest'))
+        embed.set_image(url=match['awayTeam'].get('crest'))
+        await channel.send(embed=embed, view=MatchView(match["id"]))
 
 # ==== SCORING ====
 def get_result(match):
@@ -184,7 +209,8 @@ async def send_reminders():
     now = datetime.now(timezone.utc)
     for match_id, info in list(VOTE_TRACKER.items()):
         kickoff = datetime.fromisoformat(info["kickoff"].replace("Z", "+00:00"))
-        if 25 < (kickoff - now).total_seconds() / 60 < 35:
+        if 25 < (kickoff - now).total
+                if 25 < (kickoff - now).total_seconds() / 60 < 35:
             for user_id in info["voters"]:
                 try:
                     user = await bot.fetch_user(int(user_id))
@@ -226,9 +252,15 @@ async def matches_command(interaction: discord.Interaction):
             description=f"Kickoff: {match['utcDate']}",
             color=discord.Color.green()
         )
-        embed.set_thumbnail(url=match['homeTeam'].get('crest'))
-        embed.set_image(url=match['awayTeam'].get('crest'))
-        await interaction.channel.send(embed=embed, view=MatchView(match["id"]))
+        crest_path = combine_crests(match['homeTeam'].get('crest'), match['awayTeam'].get('crest'))
+        if crest_path:
+            file = discord.File(crest_path, filename="crests.png")
+            embed.set_image(url="attachment://crests.png")
+            await interaction.channel.send(embed=embed, view=MatchView(match["id"]), file=file)
+        else:
+            embed.set_thumbnail(url=match['homeTeam'].get('crest'))
+            embed.set_image(url=match['awayTeam'].get('crest'))
+            await interaction.channel.send(embed=embed, view=MatchView(match["id"]))
 
     await interaction.response.send_message("✅ Posted upcoming matches!", ephemeral=True)
 
