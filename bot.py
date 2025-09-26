@@ -5,6 +5,9 @@ import asyncio
 from datetime import datetime, timezone, timedelta
 import discord
 from discord.ext import commands, tasks
+from discord import app_commands
+from PIL import Image, ImageDraw, ImageFont
+from io import BytesIO
 
 # ==== ENVIRONMENT VARIABLES ====
 DISCORD_BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN")
@@ -19,7 +22,7 @@ if not all([DISCORD_BOT_TOKEN, FOOTBALL_DATA_API_KEY, MATCH_CHANNEL_ID, LEADERBO
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# ==== LEADERBOARD PERSISTENCE ====
+# Leaderboard persistence
 LEADERBOARD_FILE = "leaderboard.json"
 if os.path.exists(LEADERBOARD_FILE):
     with open(LEADERBOARD_FILE, "r") as f:
@@ -27,14 +30,15 @@ if os.path.exists(LEADERBOARD_FILE):
 else:
     leaderboard = {}
 
-def save_leaderboard():
-    with open(LEADERBOARD_FILE, "w") as f:
-        json.dump(leaderboard, f)
-
 # ==== FOOTBALL API ====
 BASE_URL = "https://api.football-data.org/v4/competitions/"
 HEADERS = {"X-Auth-Token": FOOTBALL_DATA_API_KEY}
 COMPETITIONS = ["PL", "CL", "BL1", "DED", "PD", "FL1", "ELC", "PPL", "SA", "EC", "WC"]
+
+# ==== SAVE LEADERBOARD ====
+def save_leaderboard():
+    with open(LEADERBOARD_FILE, "w") as f:
+        json.dump(leaderboard, f)
 
 # ==== MATCH BUTTONS ====
 class MatchView(discord.ui.View):
@@ -54,7 +58,7 @@ class MatchView(discord.ui.View):
     async def away(self, interaction: discord.Interaction, button: discord.ui.Button):
         await record_prediction(interaction, self.match_id, "AWAY_TEAM")
 
-# ==== LEADERBOARD RESET BUTTON ====
+# ==== LEADERBOARD RESET VIEW ====
 class LeaderboardResetConfirm(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=30)
@@ -64,13 +68,16 @@ class LeaderboardResetConfirm(discord.ui.View):
         if not interaction.user.guild_permissions.administrator:
             await interaction.response.send_message("🚫 You don’t have permission.", ephemeral=True)
             return
+
         global leaderboard
         leaderboard = {}
         save_leaderboard()
         await interaction.response.send_message("✅ Leaderboard has been reset!", ephemeral=True)
+
         channel = bot.get_channel(LEADERBOARD_CHANNEL_ID)
         if channel:
             await channel.send("🔄 The leaderboard has been reset by an admin.")
+
         self.stop()
 
     @discord.ui.button(label="❌ Cancel", style=discord.ButtonStyle.secondary)
@@ -87,7 +94,7 @@ class LeaderboardView(discord.ui.View):
         if not interaction.user.guild_permissions.administrator:
             await interaction.response.send_message("🚫 You don’t have permission.", ephemeral=True)
             return
-        await interaction.response.send_message("⚠️ Are you sure you want to reset the leaderboard?",
+        await interaction.response.send_message("⚠️ Are you sure you want to reset the leaderboard?", 
                                                 view=LeaderboardResetConfirm(), ephemeral=True)
 
 # ==== RECORD PREDICTIONS ====
@@ -103,7 +110,7 @@ async def record_prediction(interaction, match_id, prediction):
 async def fetch_matches():
     now = datetime.now(timezone.utc)
     tomorrow = now + timedelta(days=1)
-    matches = []
+    matches_by_league = {}
 
     async with aiohttp.ClientSession() as session:
         for comp in COMPETITIONS:
@@ -111,10 +118,11 @@ async def fetch_matches():
             async with session.get(url, headers=HEADERS) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    matches.extend(data.get("matches", []))
-    return matches
+                    if data.get("matches"):
+                        matches_by_league[comp] = data["matches"]
+    return matches_by_league
 
-# ==== POST MATCH ====
+# ==== POST MATCH WITH CRESTS ====
 async def post_match(match):
     channel = bot.get_channel(MATCH_CHANNEL_ID)
     if not channel:
@@ -122,67 +130,88 @@ async def post_match(match):
 
     home_name = match["homeTeam"]["name"]
     away_name = match["awayTeam"]["name"]
-    home_crest = match["homeTeam"].get("crest", "")
-    away_crest = match["awayTeam"].get("crest", "")
+    home_crest_url = match["homeTeam"].get("crest")
+    away_crest_url = match["awayTeam"].get("crest")
+
+    default_img = Image.new("RGBA", (80, 80), (255, 255, 255, 0))
+
+    async with aiohttp.ClientSession() as session:
+        # Home
+        if home_crest_url:
+            try:
+                async with session.get(home_crest_url) as r:
+                    home_img = Image.open(BytesIO(await r.read())).convert("RGBA")
+            except:
+                home_img = default_img
+        else:
+            home_img = default_img
+
+        # Away
+        if away_crest_url:
+            try:
+                async with session.get(away_crest_url) as r:
+                    away_img = Image.open(BytesIO(await r.read())).convert("RGBA")
+            except:
+                away_img = default_img
+        else:
+            away_img = default_img
+
+    crest_size = (80, 80)
+    home_img = home_img.resize(crest_size)
+    away_img = away_img.resize(crest_size)
+
+    spacing = 30
+    total_width = crest_size[0]*2 + spacing
+    total_height = crest_size[1] + 20
+
+    final_img = Image.new("RGBA", (total_width, total_height), (255, 255, 255, 0))
+    final_img.paste(home_img, (0, 0), home_img)
+    final_img.paste(away_img, (crest_size[0]+spacing, 0), away_img)
+
+    draw = ImageDraw.Draw(final_img)
+    font = ImageFont.load_default()
+    draw.text((0, crest_size[1]), home_name, fill="black")
+    draw.text((crest_size[0]+spacing, crest_size[1]), away_name, fill="black")
+
+    img_bytes = BytesIO()
+    final_img.save(img_bytes, format="PNG")
+    img_bytes.seek(0)
 
     embed = discord.Embed(
         title=f"{home_name} vs {away_name}",
         description=f"Kickoff: {match['utcDate']}",
         color=discord.Color.blue()
     )
+    file = discord.File(fp=img_bytes, filename="match.png")
+    embed.set_image(url="attachment://match.png")
 
-    if home_crest:
-        embed.set_thumbnail(url=home_crest)
-    if away_crest:
-        embed.set_image(url=away_crest)
+    await channel.send(embed=embed, file=file, view=MatchView(match["id"]))
 
-    await channel.send(embed=embed, view=MatchView(match["id"]))
-
-# ==== BACKGROUND AUTO POST ====
+# ==== AUTO POST ====
 @tasks.loop(minutes=30)
 async def auto_post_matches():
-    matches = await fetch_matches()
-    if not matches:
+    matches_by_league = await fetch_matches()
+    if not matches_by_league:
         return
-
-    # Group by league
-    matches_by_league = {}
-    for match in matches:
-        league_name = match["competition"]["name"]
-        matches_by_league.setdefault(league_name, []).append(match)
-
-    for league, league_matches in matches_by_league.items():
-        header = f"\n🏆 **__{league.upper()} MATCHES__** 🏆\n"
+    for league, matches in matches_by_league.items():
         channel = bot.get_channel(MATCH_CHANNEL_ID)
         if channel:
-            await channel.send(header)
-
-        for match in league_matches:
+            await channel.send(f"🏆 **{league} Matches**")
+        for match in matches:
             await post_match(match)
-            await asyncio.sleep(0.5)
 
 # ==== COMMANDS ====
 @bot.tree.command(name="matches", description="Show upcoming matches.")
 async def matches_command(interaction: discord.Interaction):
-    matches = await fetch_matches()
-    if not matches:
+    matches_by_league = await fetch_matches()
+    if not matches_by_league:
         await interaction.response.send_message("No upcoming matches.", ephemeral=True)
         return
 
-    # Group by league
-    matches_by_league = {}
-    for match in matches:
-        league_name = match["competition"]["name"]
-        matches_by_league.setdefault(league_name, []).append(match)
-
-    for league, league_matches in matches_by_league.items():
-        header = f"\n🏆 **__{league.upper()} MATCHES__** 🏆\n"
-        await interaction.channel.send(header)
-
-        for match in league_matches[:5]:
+    for league, matches in matches_by_league.items():
+        await interaction.channel.send(f"🏆 **{league} Matches**")
+        for match in matches[:5]:
             await post_match(match)
-            await interaction.channel.send("\u200b")  # spacing
-
     await interaction.response.send_message("✅ Posted upcoming matches!", ephemeral=True)
 
 @bot.tree.command(name="leaderboard", description="Show the leaderboard.")
