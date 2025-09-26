@@ -8,18 +8,19 @@ from datetime import datetime, timezone, timedelta
 TOKEN = "YOUR_DISCORD_BOT_TOKEN"
 API_KEY = "YOUR_FOOTBALL_DATA_API_KEY"
 LEADERBOARD_CHANNEL_ID = YOUR_CHANNEL_ID  # Channel for leaderboard
-POST_CHANNEL_ID = YOUR_CHANNEL_ID  # Channel to post matches
-TRACKED_COMPETITIONS = ["PL", "PD", "SA", "CL", "EL", "WC"]  # Codes for leagues
+POST_CHANNEL_ID = YOUR_CHANNEL_ID         # Channel to post matches
+TRACKED_COMPETITIONS = ["PL", "PD", "SA", "CL", "EL", "WC"]  # League codes
 
 # ------------------ GLOBALS ------------------
 bot = commands.Bot(command_prefix="!", intents=discord.Intents.all())
 tree = bot.tree
 
 posted_matches = set()
-match_lookup = {}  # match_id -> match info
-user_bets = {}     # match_id -> {user_id: choice}
-server_points = {}  # guild_id -> {user_id: points}
+match_lookup = {}       # match_id -> match info
+user_bets = {}          # match_id -> {user_id: choice}
+server_points = {}      # guild_id -> {user_id: points}
 leaderboard_message_id = None
+match_messages = {}     # match_id -> message object for countdown
 
 # ------------------ MATCH FETCHING ------------------
 def fetch_upcoming_matches():
@@ -28,7 +29,7 @@ def fetch_upcoming_matches():
     today = datetime.utcnow().date()
     tomorrow = today + timedelta(days=1)
     params = {"dateFrom": str(today), "dateTo": str(tomorrow)}
-    
+
     try:
         resp = requests.get(url, headers=headers, params=params)
         if resp.status_code != 200:
@@ -93,7 +94,7 @@ async def get_leaderboard_embed(guild_id):
     for i, (user_id, pts) in enumerate(sorted_points):
         medal = medals[i] if i < 3 else f"{i+1}."
         lines.append(f"{medal} <@{user_id}> — **{pts} point{'s' if pts != 1 else ''}**")
-    
+
     embed = discord.Embed(title="🏆 Server Leaderboard 🏆", description="\n".join(lines), color=discord.Color.gold())
     embed.set_footer(text="Keep betting to climb the ranks! ⚽")
     return embed
@@ -149,10 +150,14 @@ async def update_match_results():
                             server_points[guild_id][user_id] = 0
                         if choice == result:
                             server_points[guild_id][user_id] += 1
-                    await post_or_update_leaderboard(interaction.guild.id if interaction := None else guild_id)
+                # Update leaderboard for all guilds
+                for guild_id in server_points:
+                    await post_or_update_leaderboard(guild_id)
 
                 posted_matches.discard(match_id)
                 match_lookup.pop(match_id, None)
+                match_messages.pop(match_id, None)
+
     except Exception as e:
         print("Error updating match results:", e)
 
@@ -180,14 +185,44 @@ async def auto_post_matches():
         embed.set_thumbnail(url=logo_home)
         embed.set_image(url=logo_away)
 
-        await channel.send(embed=embed, view=BetView(match_id))
+        msg = await channel.send(embed=embed, view=BetView(match_id))
         posted_matches.add(match_id)
         match_lookup[match_id] = m
+        match_messages[match_id] = msg
 
-# ------------------ TASK TO UPDATE RESULTS ------------------
-@tasks.loop(minutes=5)
-async def auto_update_results():
-    await update_match_results()
+# ------------------ COUNTDOWN UPDATES ------------------
+@tasks.loop(minutes=1)
+async def update_match_countdowns():
+    now = datetime.utcnow().replace(tzinfo=timezone.utc)
+    for match_id, msg in list(match_messages.items()):
+        match = match_lookup.get(match_id)
+        if not match:
+            continue
+
+        match_time = datetime.fromisoformat(match["utcDate"].replace("Z", "+00:00"))
+        delta = match_time - now
+        if delta.total_seconds() <= 0:
+            continue
+
+        hours, remainder = divmod(int(delta.total_seconds()), 3600)
+        minutes, _ = divmod(remainder, 60)
+        home = match["homeTeam"]["name"]
+        away = match["awayTeam"]["name"]
+
+        embed = discord.Embed(
+            title=f"{home} vs {away}",
+            description=f"Kickoff in {hours}h {minutes}m",
+            color=discord.Color.blue()
+        )
+        logo_home = match["homeTeam"].get("crest", "")
+        logo_away = match["awayTeam"].get("crest", "")
+        embed.set_thumbnail(url=logo_home)
+        embed.set_image(url=logo_away)
+
+        try:
+            await msg.edit(embed=embed)
+        except:
+            continue
 
 # ------------------ BOT EVENTS ------------------
 @bot.event
@@ -196,6 +231,7 @@ async def on_ready():
     await tree.sync()
     auto_post_matches.start()
     auto_update_results.start()
+    update_match_countdowns.start()
 
 # ------------------ SLASH COMMANDS ------------------
 @tree.command(name="leaderboard", description="Show server leaderboard")
