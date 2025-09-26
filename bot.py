@@ -66,10 +66,14 @@ class MatchView(discord.ui.View):
         user_id = str(interaction.user.id)
         if user_id not in leaderboard:
             leaderboard[user_id] = {"name": interaction.user.name, "points": 0, "predictions": {}}
+
+        if str(self.match_id) in leaderboard[user_id]["predictions"]:
+            await interaction.response.send_message("🔒 You already voted on this match.", ephemeral=True)
+            return
+
         leaderboard[user_id]["predictions"][str(self.match_id)] = prediction
         save_leaderboard()
 
-        # Personalized button view
         view = discord.ui.View()
         for child in self.children:
             label = child.label
@@ -83,7 +87,7 @@ class MatchView(discord.ui.View):
                 }.get(key, discord.ButtonStyle.primary)
             view.add_item(discord.ui.Button(label=label, style=style, disabled=True))
 
-        embed = discord.Embed(description=f"✅ Prediction saved: **{prediction}**")
+        embed = discord.Embed(description=f"✅ You voted: **{prediction}**")
         embed.set_thumbnail(url=interaction.user.display_avatar.url)
         await interaction.response.send_message(embed=embed, ephemeral=True, view=view)
 
