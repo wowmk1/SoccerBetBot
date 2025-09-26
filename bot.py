@@ -121,7 +121,7 @@ class MatchView(discord.ui.View):
         file = discord.File(fp=image_buffer, filename="match.png")
         embed = self.message.embeds[0]
         embed.set_image(url="attachment://match.png")
-        await self.message.edit(embed=embed, file=file)
+        await self.message.edit(embed=embed)  # <-- Fixed: remove file here
 
         await interaction.response.send_message(f"✅ Prediction saved: **{prediction}**", ephemeral=True)
 
@@ -161,9 +161,10 @@ async def post_match(match):
     file = discord.File(fp=image_buffer, filename="match.png")
     embed.set_image(url="attachment://match.png")
 
+    # Send message with file and view
     msg = await channel.send(embed=embed, file=file)
     view = MatchView(match["id"], msg, home_crest, away_crest)
-    await msg.edit(view=view, embed=embed, file=file)
+    await msg.edit(view=view)  # <-- Fixed: only edit view here
 
 # ==== AUTO POST MATCHES ====
 @tasks.loop(minutes=30)
