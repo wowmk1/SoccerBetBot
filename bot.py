@@ -37,7 +37,7 @@ def save_leaderboard():
 # ==== FOOTBALL API ====
 BASE_URL = "https://api.football-data.org/v4/competitions/"
 HEADERS = {"X-Auth-Token": FOOTBALL_DATA_API_KEY}
-COMPETITIONS = ["PL", "CL", "BL1", "PD", "FL1", "SA", "EC", "WC"]  # exclude DED, ELC, PPL
+COMPETITIONS = ["PL", "CL", "BL1", "PD", "FL1", "SA", "EC", "WC"]  # excluded DED, ELC, PPL
 
 # ==== VOTE EMOJIS (CUSTOM SERVER EMOJIS) ====
 VOTE_EMOJIS = {
@@ -222,8 +222,18 @@ async def matches_command(interaction: discord.Interaction):
     if not matches:
         await interaction.response.send_message("No upcoming matches.", ephemeral=True)
         return
+
+    # Group matches by league
+    league_dict = {}
     for m in matches[:10]:
-        await post_match(m)
+        league_name = m["competition"].get("name", "Unknown League")
+        league_dict.setdefault(league_name, []).append(m)
+
+    for league_name, league_matches in league_dict.items():
+        await interaction.channel.send(f"🏟 **{league_name}**")
+        for m in league_matches:
+            await post_match(m)
+
     await interaction.response.send_message("✅ Posted upcoming matches!", ephemeral=True)
 
 @bot.tree.command(name="leaderboard", description="Show the leaderboard.")
@@ -250,7 +260,22 @@ async def on_ready():
 @tasks.loop(minutes=30)
 async def auto_post_matches():
     matches = await fetch_matches()
+    if not matches:
+        return
+
+    # Group matches by league
+    league_dict = {}
     for m in matches:
-        await post_match(m)
+        league_name = m["competition"].get("name", "Unknown League")
+        league_dict.setdefault(league_name, []).append(m)
+
+    channel = bot.get_channel(MATCH_CHANNEL_ID)
+    if not channel:
+        return
+
+    for league_name, league_matches in league_dict.items():
+        await channel.send(f"🏟 **{league_name}**")
+        for m in league_matches:
+            await post_match(m)
 
 bot.run(DISCORD_BOT_TOKEN)
