@@ -97,7 +97,6 @@ async def fetch_matches():
                         m["competition"]["name"] = data.get("competition", {}).get("name", comp)
                         matches.append(m)
 
-    # Filter strictly for matches within the next 24h
     return [
         m for m in matches
         if now <= datetime.fromisoformat(m['utcDate'].replace("Z", "+00:00")) <= next_24h
@@ -109,7 +108,6 @@ async def post_match(match):
     if match_time < datetime.now(timezone.utc):
         return
 
-    # Format kickoff as Discord timestamp
     kickoff_ts = int(match_time.timestamp())
 
     channel = bot.get_channel(MATCH_CHANNEL_ID)
@@ -129,7 +127,6 @@ async def post_match(match):
         color=discord.Color.blue()
     )
 
-    # Generate combined image
     home_crest = match["homeTeam"].get("crest")
     away_crest = match["awayTeam"].get("crest")
     file = None
@@ -140,7 +137,6 @@ async def post_match(match):
 
     msg = await channel.send(embed=embed, file=file)
 
-    # Store kickoff time
     if not hasattr(bot, "match_times"):
         bot.match_times = {}
     bot.match_times[str(msg.id)] = match_time
@@ -165,10 +161,11 @@ async def on_raw_reaction_add(payload):
     message = await channel.fetch_message(payload.message_id)
     match_id = str(message.id)
 
-    emoji_name = payload.emoji.name
+    emoji_name = getattr(payload.emoji, "name", str(payload.emoji))
     if emoji_name not in VOTE_EMOJIS:
+        # Remove any invalid reaction immediately
         async for react in message.reactions:
-            if getattr(react.emoji, "name", None) == emoji_name:
+            if getattr(react.emoji, "name", str(react.emoji)) == emoji_name:
                 async for u in react.users():
                     if u.id == payload.user_id:
                         await react.remove(u)
@@ -183,9 +180,10 @@ async def on_raw_reaction_add(payload):
     if user_id not in leaderboard:
         leaderboard[user_id] = {"name": user.name, "points": 0, "predictions": {}}
 
-    # Enforce one vote per user
+    # Remove all other reactions by this user (enforce one vote)
     for react in message.reactions:
-        if getattr(react.emoji, "name", None) != emoji_name:
+        react_name = getattr(react.emoji, "name", str(react.emoji))
+        if react_name != emoji_name:
             async for u in react.users():
                 if u.id == payload.user_id:
                     await react.remove(u)
@@ -193,11 +191,11 @@ async def on_raw_reaction_add(payload):
     leaderboard[user_id]["predictions"][match_id] = VOTE_EMOJIS[emoji_name]
     save_leaderboard()
 
-    # Update embed description only (image stays)
+    # Update embed description only (keep image)
     voter_names = [v["name"] for uid, v in leaderboard.items() if match_id in v.get("predictions", {})]
     embed = message.embeds[0]
-    kickoff_line = embed.description.split("Kickoff:")[1].splitlines()[0].strip()
 
+    kickoff_line = embed.description.split("Kickoff:")[1].splitlines()[0].strip()
     new_desc = f"Kickoff: {kickoff_line}"
     if voter_names:
         new_desc += "\n\n**Voted:** " + ", ".join(voter_names)
@@ -207,7 +205,6 @@ async def on_raw_reaction_add(payload):
         description=new_desc,
         color=embed.color
     )
-
     if embed.image.url:
         new_embed.set_image(url=embed.image.url)
 
