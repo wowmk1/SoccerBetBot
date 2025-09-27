@@ -61,6 +61,9 @@ VOTE_EMOJIS = {
 # ==== TRACK VOTES SEPARATELY ====
 vote_data = {}  # {match_msg_id: {"home": set(), "draw": set(), "away": set(), "votes_msg_id": int}}
 
+# ==== TRACK LAST LEADERBOARD MESSAGE ====
+last_leaderboard_msg_id = None
+
 def create_votes_embed(votes_dict):
     embed = discord.Embed(title="Current Votes", color=discord.Color.green())
     embed.add_field(
@@ -183,7 +186,7 @@ async def post_match(match):
     posted_matches.add(match_id)
     save_posted()
 
-# ==== REACTION HANDLER WITH SEPARATE VOTES EMBED ====
+# ==== REACTION HANDLER ====
 @bot.event
 async def on_raw_reaction_add(payload):
     if payload.user_id == bot.user.id:
@@ -198,21 +201,22 @@ async def on_raw_reaction_add(payload):
         return
     message = await channel.fetch_message(payload.message_id)
 
+    # Initialize vote tracking for this match if not exists
     if payload.message_id not in vote_data:
         vote_data[payload.message_id] = {"home": set(), "draw": set(), "away": set(), "votes_msg_id": None}
 
     user = await bot.fetch_user(payload.user_id)
 
-    # Remove user from other categories
-    for cat in ["home", "draw", "away"]:
-        vote_data[payload.message_id][cat].discard(user.name)
-
-    # Add user to correct category
+    # ---- REMOVE USER FROM ALL OTHER OPTIONS ----
+    for category in ["home", "draw", "away"]:
+        vote_data[payload.message_id][category].discard(user.name)
+    
+    # ---- ADD USER TO THE SELECTED OPTION ----
     for key, val in VOTE_EMOJIS.items():
         if emoji_name == val:
             vote_data[payload.message_id][key].add(user.name)
 
-    # Remove other reactions by the same user
+    # ---- REMOVE OTHER REACTIONS BY THE SAME USER ----
     for react in message.reactions:
         react_name = getattr(react.emoji, "name", str(react.emoji))
         if react_name != emoji_name:
@@ -220,7 +224,7 @@ async def on_raw_reaction_add(payload):
                 if u.id == payload.user_id:
                     await react.remove(u)
 
-    # Update votes embed
+    # ---- UPDATE VOTES EMBED ----
     votes_msg_id = vote_data[payload.message_id]["votes_msg_id"]
     embed = create_votes_embed(vote_data[payload.message_id])
 
@@ -235,7 +239,7 @@ async def on_raw_reaction_add(payload):
         votes_message = await channel.send(embed=embed)
         vote_data[payload.message_id]["votes_msg_id"] = votes_message.id
 
-    # Update leaderboard
+    # ---- UPDATE LEADERBOARD ----
     user_id = str(payload.user_id)
     if user_id not in leaderboard:
         leaderboard[user_id] = {"name": user.name, "points": 0, "predictions": {}}
@@ -245,6 +249,7 @@ async def on_raw_reaction_add(payload):
 # ==== UPDATE MATCH RESULTS & LEADERBOARD ====
 @tasks.loop(minutes=5)
 async def update_match_results():
+    global last_leaderboard_msg_id
     leaderboard_changed = False
     async with aiohttp.ClientSession() as session:
         for comp in COMPETITIONS:
@@ -270,35 +275,28 @@ async def update_match_results():
 
     if leaderboard_changed:
         channel = bot.get_channel(LEADERBOARD_CHANNEL_ID)
-        if channel:
-            users = [v for v in leaderboard.values() if v.get("predictions")]
-            if users:
-                sorted_lb = sorted(users, key=lambda x: (-x.get("points", 0), x["name"].lower()))
-                desc = "\n".join([f"**{i+1}. {entry['name']}** — {entry['points']} pts"
-                                  for i, entry in enumerate(sorted_lb[:10])])
-                embed = discord.Embed(title="🏆 Leaderboard", description=desc, color=discord.Color.gold())
-                await channel.send(embed=embed)
+        if not channel:
+            return
 
-# ==== AUTO POST MATCHES ====
-@tasks.loop(minutes=30)
-async def auto_post_matches():
-    matches = await fetch_matches()
-    if not matches:
-        return
+        users = [v for v in leaderboard.values() if v.get("predictions")]
+        if not users:
+            return
 
-    league_dict = {}
-    for m in matches:
-        league_name = m["competition"].get("name", "Unknown League")
-        league_dict.setdefault(league_name, []).append(m)
+        sorted_lb = sorted(users, key=lambda x: (-x.get("points", 0), x["name"].lower()))
+        desc = "\n".join([f"**{i+1}. {entry['name']}** — {entry.get('points',0)} pts"
+                          for i, entry in enumerate(sorted_lb[:10])])
+        embed = discord.Embed(title="🏆 Leaderboard", description=desc, color=discord.Color.gold())
 
-    channel = bot.get_channel(MATCH_CHANNEL_ID)
-    if not channel:
-        return
-
-    for league_name, league_matches in league_dict.items():
-        await channel.send(f"🏟 **{league_name}**")
-        for m in league_matches:
-            await post_match(m)
+        try:
+            if last_leaderboard_msg_id:
+                msg = await channel.fetch_message(last_leaderboard_msg_id)
+                await msg.edit(embed=embed)
+            else:
+                msg = await channel.send(embed=embed)
+                last_leaderboard_msg_id = msg.id
+        except:
+            msg = await channel.send(embed=embed)
+            last_leaderboard_msg_id = msg.id
 
 # ==== COMMANDS ====
 @bot.tree.command(name="matches", description="Show upcoming matches in the next 24 hours.")
@@ -327,7 +325,7 @@ async def leaderboard_command(interaction: discord.Interaction):
         await interaction.response.send_message("Leaderboard is empty.", ephemeral=True)
         return
     sorted_lb = sorted(users, key=lambda x: (-x.get("points", 0), x["name"].lower()))
-    desc = "\n".join([f"**{i+1}. {entry['name']}** — {entry['points']} pts"
+    desc = "\n".join([f"**{i+1}. {entry['name']}** — {entry.get('points',0)} pts"
                       for i, entry in enumerate(sorted_lb[:10])])
     embed = discord.Embed(title="🏆 Leaderboard", description=desc, color=discord.Color.gold())
     await interaction.response.send_message(embed=embed)
@@ -339,5 +337,26 @@ async def on_ready():
     auto_post_matches.start()
     update_match_results.start()
     print(f"Logged in as {bot.user}")
+
+# ==== AUTO POST MATCHES ====
+@tasks.loop(minutes=30)
+async def auto_post_matches():
+    matches = await fetch_matches()
+    if not matches:
+        return
+
+    league_dict = {}
+    for m in matches:
+        league_name = m["competition"].get("name", "Unknown League")
+        league_dict.setdefault(league_name, []).append(m)
+
+    channel = bot.get_channel(MATCH_CHANNEL_ID)
+    if not channel:
+        return
+
+    for league_name, league_matches in league_dict.items():
+        await channel.send(f"🏟 **{league_name}**")
+        for m in league_matches:
+            await post_match(m)
 
 bot.run(DISCORD_BOT_TOKEN)
