@@ -34,6 +34,18 @@ def save_leaderboard():
     with open(LEADERBOARD_FILE, "w") as f:
         json.dump(leaderboard, f)
 
+# ==== TRACK POSTED MATCHES ====
+POSTED_FILE = "posted_matches.json"
+if os.path.exists(POSTED_FILE):
+    with open(POSTED_FILE, "r") as f:
+        posted_matches = set(json.load(f))
+else:
+    posted_matches = set()
+
+def save_posted():
+    with open(POSTED_FILE, "w") as f:
+        json.dump(list(posted_matches), f)
+
 # ==== FOOTBALL API ====
 BASE_URL = "https://api.football-data.org/v4/competitions/"
 HEADERS = {"X-Auth-Token": FOOTBALL_DATA_API_KEY}
@@ -104,17 +116,19 @@ async def fetch_matches():
 
 # ==== POST MATCH ====
 async def post_match(match):
+    match_id = str(match["id"])
+    if match_id in posted_matches:
+        return  # Already posted
+
     match_time = datetime.fromisoformat(match['utcDate'].replace("Z", "+00:00"))
     if match_time < datetime.now(timezone.utc):
         return
 
     kickoff_ts = int(match_time.timestamp())
-
     channel = bot.get_channel(MATCH_CHANNEL_ID)
     if not channel:
         return
 
-    match_id = str(match["id"])
     voter_names = [v["name"] for uid, v in leaderboard.items() if match_id in v.get("predictions", {})]
 
     embed_desc = f"Kickoff: <t:{kickoff_ts}:f>"
@@ -141,12 +155,15 @@ async def post_match(match):
         bot.match_times = {}
     bot.match_times[str(msg.id)] = match_time
 
-    # Add custom emoji reactions
     guild = channel.guild
     for emoji_name in VOTE_EMOJIS.keys():
         emoji = discord.utils.get(guild.emojis, name=emoji_name)
         if emoji:
             await msg.add_reaction(emoji)
+
+    # Mark as posted
+    posted_matches.add(match_id)
+    save_posted()
 
 # ==== REACTION HANDLER ====
 @bot.event
@@ -163,9 +180,10 @@ async def on_raw_reaction_add(payload):
 
     emoji_name = getattr(payload.emoji, "name", str(payload.emoji))
     if emoji_name not in VOTE_EMOJIS:
-        # Remove any invalid reaction immediately
-        async for react in message.reactions:
-            if getattr(react.emoji, "name", str(react.emoji)) == emoji_name:
+        # Remove invalid emoji
+        for react in message.reactions:
+            react_name = getattr(react.emoji, "name", str(react.emoji))
+            if react_name == emoji_name:
                 async for u in react.users():
                     if u.id == payload.user_id:
                         await react.remove(u)
@@ -180,7 +198,7 @@ async def on_raw_reaction_add(payload):
     if user_id not in leaderboard:
         leaderboard[user_id] = {"name": user.name, "points": 0, "predictions": {}}
 
-    # Remove all other reactions by this user (enforce one vote)
+    # Remove other reactions by user
     for react in message.reactions:
         react_name = getattr(react.emoji, "name", str(react.emoji))
         if react_name != emoji_name:
@@ -191,7 +209,7 @@ async def on_raw_reaction_add(payload):
     leaderboard[user_id]["predictions"][match_id] = VOTE_EMOJIS[emoji_name]
     save_leaderboard()
 
-    # Update embed description only (keep image)
+    # Update embed description
     voter_names = [v["name"] for uid, v in leaderboard.items() if match_id in v.get("predictions", {})]
     embed = message.embeds[0]
 
