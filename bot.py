@@ -335,14 +335,14 @@ class PersistentMatchView(View):
                     except Exception as e:
                         print(f"Error creating votes reply: {e}")
             else:
-                # Create first votes message as reply to match message
+                # Create first votes message as reply to match message - this keeps it grouped!
                 try:
                     match_message = await interaction.channel.fetch_message(match_msg_id)
                     votes_message = await match_message.reply(embed=embed, mention_author=False)
                     vote_data[match_id]["votes_msg_id"] = votes_message.id
                 except Exception as e:
                     print(f"Error creating votes reply: {e}")
-                    # Fallback: create at bottom if reply fails
+                    # Only fallback to bottom posting if reply completely fails
                     votes_message = await interaction.channel.send(embed=embed)
                     vote_data[match_id]["votes_msg_id"] = votes_message.id
             
