@@ -52,21 +52,22 @@ HEADERS = {"X-Auth-Token": FOOTBALL_DATA_API_KEY}
 COMPETITIONS = ["PL", "CL", "BL1", "PD", "FL1", "SA", "EC", "WC"]
 
 # ==== TRACK VOTES ====
-vote_data = {}  # {match_msg_id: {"home": set(), "draw": set(), "away": set(), "votes_msg_id": int, "locked_users": set()}}
+vote_data = {}  # match_id: {"home": set(), "draw": set(), "away": set(), "votes_msg_id": int, "locked_users": set()}
 last_leaderboard_msg_id = None
 
-# ==== VOTES EMBED ====
-def create_votes_embed(votes_dict):
+# ==== VOTES EMBED CREATION ====
+def create_votes_embed(match_id, current_user=None):
+    votes_dict = vote_data[match_id]
     embed = discord.Embed(title="Current Votes", color=discord.Color.green())
 
-    home_voters = ", ".join(sorted(votes_dict["home"])) if votes_dict["home"] else "No votes yet"
-    draw_voters = ", ".join(sorted(votes_dict["draw"])) if votes_dict["draw"] else "No votes yet"
-    away_voters = ", ".join(sorted(votes_dict["away"])) if votes_dict["away"] else "No votes yet"
-
-    embed.add_field(name="Home", value=home_voters, inline=False)
-    embed.add_field(name="Draw", value=draw_voters, inline=False)
-    embed.add_field(name="Away", value=away_voters, inline=False)
-
+    for option in ["home", "draw", "away"]:
+        voters = []
+        for name in sorted(votes_dict[option]):
+            if current_user and name == current_user.name:
+                voters.append(f"{name} ✅")
+            else:
+                voters.append(name)
+        embed.add_field(name=option.capitalize(), value=", ".join(voters) if voters else "No votes yet", inline=False)
     return embed
 
 # ==== GENERATE MATCH IMAGE ====
@@ -125,25 +126,20 @@ async def fetch_matches():
         if now <= datetime.fromisoformat(m['utcDate'].replace("Z", "+00:00")) <= next_24h
     ]
 
-# ==== BUTTON CLASS ====
+# ==== VOTE BUTTON ====
 class VoteButton(Button):
-    def __init__(self, label, category, match_msg_id):
+    def __init__(self, label, category, match_id):
         super().__init__(label=label, style=discord.ButtonStyle.primary)
         self.category = category
-        self.match_msg_id = match_msg_id
+        self.match_id = match_id
 
     async def callback(self, interaction: discord.Interaction):
         user = interaction.user
-        match_id = self.match_msg_id
+        match_id = self.match_id
 
         if match_id not in vote_data:
-            vote_data[match_id] = {
-                "home": set(),
-                "draw": set(),
-                "away": set(),
-                "votes_msg_id": None,
-                "locked_users": set()
-            }
+            vote_data[match_id] = {"home": set(), "draw": set(), "away": set(),
+                                   "votes_msg_id": None, "locked_users": set()}
 
         if user.id in vote_data[match_id]["locked_users"]:
             await interaction.response.send_message("✅ You have already voted!", ephemeral=True)
@@ -155,7 +151,7 @@ class VoteButton(Button):
 
         # Update votes embed
         votes_msg_id = vote_data[match_id]["votes_msg_id"]
-        embed = create_votes_embed(vote_data[match_id])
+        embed = create_votes_embed(match_id, current_user=user)
         if votes_msg_id:
             votes_message = await interaction.channel.fetch_message(votes_msg_id)
             await votes_message.edit(embed=embed)
@@ -167,12 +163,10 @@ class VoteButton(Button):
         user_id = str(user.id)
         if user_id not in leaderboard:
             leaderboard[user_id] = {"name": user.name, "points": 0, "predictions": {}}
-        leaderboard[user_id]["predictions"][str(match_id)] = self.category
+        leaderboard[user_id]["predictions"][match_id] = self.category
         save_leaderboard()
 
-        # Update this button label to show user voted
-        self.label = f"{self.label} ✅"
-        await interaction.response.edit_message(view=self.view)
+        await interaction.response.send_message(f"You voted for **{self.label}**!", ephemeral=True)
 
 # ==== POST MATCH ====
 async def post_match(match):
@@ -203,14 +197,13 @@ async def post_match(match):
         file = discord.File(fp=image_buffer, filename="match.png")
         embed.set_image(url="attachment://match.png")
 
-    # Buttons
+    # Add vote buttons
     view = View()
-    view.add_item(VoteButton(label="Home", category="home", match_msg_id=match_id))
-    view.add_item(VoteButton(label="Draw", category="draw", match_msg_id=match_id))
-    view.add_item(VoteButton(label="Away", category="away", match_msg_id=match_id))
+    view.add_item(VoteButton(label="Home", category="home", match_id=match_id))
+    view.add_item(VoteButton(label="Draw", category="draw", match_id=match_id))
+    view.add_item(VoteButton(label="Away", category="away", match_id=match_id))
 
-    msg = await channel.send(embed=embed, file=file, view=view)
-
+    await channel.send(embed=embed, file=file, view=view)
     vote_data[match_id] = {"home": set(), "draw": set(), "away": set(),
                            "votes_msg_id": None, "locked_users": set()}
     posted_matches.add(match_id)
