@@ -336,4 +336,71 @@ async def on_ready():
 scheduler = AsyncIOScheduler()
 scheduler.add_job(lambda: bot.loop.create_task(daily_fetch_matches()), "cron", hour=6, minute=0)  # 6 AM UTC
 
+# ==== TEST MATCHES COMMAND ====
+@bot.tree.command(name="test_matches", description="Post test matches for voting and leaderboard testing.")
+async def test_matches_command(interaction: discord.Interaction):
+    now = datetime.now(timezone.utc)
+    test_matches = [
+        {
+            "id": 9991,
+            "homeTeam": {"name": "Crystal Palace FC", "crest": None},
+            "awayTeam": {"name": "Liverpool FC", "crest": None},
+            "utcDate": (now + timedelta(minutes=1)).isoformat(),
+            "competition": {"name": "Premier League"}
+        },
+        {
+            "id": 9992,
+            "homeTeam": {"name": "Manchester United", "crest": None},
+            "awayTeam": {"name": "Chelsea FC", "crest": None},
+            "utcDate": (now + timedelta(minutes=2)).isoformat(),
+            "competition": {"name": "Premier League"}
+        }
+    ]
+
+    for match in test_matches:
+        await post_match(match)
+
+    await interaction.response.send_message("✅ Posted test matches for voting!", ephemeral=True)
+
+# ==== OPTIONAL: SIMULATE MATCH RESULTS AFTER 1 MINUTE FOR TESTING ====
+async def simulate_results():
+    await bot.wait_until_ready()
+    await discord.utils.sleep_until(datetime.now(timezone.utc) + timedelta(minutes=1))
+    for match_id in ["9991", "9992"]:
+        if match_id in vote_data:
+            # randomly select a winner for test purposes
+            import random
+            winner = random.choice(["home", "draw", "away"])
+            # Manually call update_match_results logic for this match
+            # Assign points
+            for uid, v in leaderboard.items():
+                if v.get("predictions", {}).get(match_id) == winner:
+                    v["points"] = v.get("points", 0) + 1
+            # Update vote embed
+            channel = bot.get_channel(MATCH_CHANNEL_ID)
+            if channel:
+                try:
+                    votes_message = await channel.fetch_message(vote_data[match_id]["votes_msg_id"])
+                    embed = create_votes_embed(match_id, match_result=winner)
+                    new_view = View()
+                    for item in votes_message.components[0].children:
+                        item.disabled = True
+                        new_view.add_item(item)
+                    await votes_message.edit(embed=embed, view=new_view)
+                except: pass
+    save_leaderboard()
+    # Update leaderboard channel
+    channel = bot.get_channel(LEADERBOARD_CHANNEL_ID)
+    if channel:
+        users = [v for v in leaderboard.values() if v.get("predictions")]
+        if users:
+            sorted_lb = sorted(users, key=lambda x: (-x.get("points", 0), x["name"].lower()))
+            desc_lines = [f"**{i+1}. {entry['name']}** — {entry.get('points',0)} pts" for i, entry in enumerate(sorted_lb[:10])]
+            embed = discord.Embed(title="🏆 Leaderboard", description="\n".join(desc_lines), color=discord.Color.gold())
+            await channel.send(embed=embed)
+
+bot.loop.create_task(simulate_results())
+
+
 bot.run(DISCORD_BOT_TOKEN)
+
