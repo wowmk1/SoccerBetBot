@@ -56,18 +56,17 @@ vote_data = {}  # match_id: {"home": set(), "draw": set(), "away": set(), "votes
 last_leaderboard_msg_id = None
 
 # ==== VOTES EMBED CREATION ====
-def create_votes_embed(match_id, current_user=None):
+def create_votes_embed(match_id):
     votes_dict = vote_data[match_id]
     embed = discord.Embed(title="Current Votes", color=discord.Color.green())
 
     for option in ["home", "draw", "away"]:
-        voters = []
-        for name in sorted(votes_dict[option]):
-            if current_user and name == current_user.name:
-                voters.append(f"{name} ✅")
-            else:
-                voters.append(name)
-        embed.add_field(name=option.capitalize(), value=", ".join(voters) if voters else "No votes yet", inline=False)
+        voters = sorted(votes_dict[option])
+        embed.add_field(
+            name=option.capitalize(),
+            value="\n".join(voters) if voters else "No votes yet",
+            inline=False
+        )
     return embed
 
 # ==== GENERATE MATCH IMAGE ====
@@ -151,7 +150,7 @@ class VoteButton(Button):
 
         # Update votes embed
         votes_msg_id = vote_data[match_id]["votes_msg_id"]
-        embed = create_votes_embed(match_id, current_user=user)
+        embed = create_votes_embed(match_id)
         if votes_msg_id:
             votes_message = await interaction.channel.fetch_message(votes_msg_id)
             await votes_message.edit(embed=embed)
@@ -294,10 +293,8 @@ async def leaderboard_command(interaction: discord.Interaction):
     if not users:
         await interaction.response.send_message("Leaderboard is empty.", ephemeral=True)
         return
-
     sorted_lb = sorted(users, key=lambda x:(-x.get("points",0), x["name"].lower()))
-    desc = "\n".join([f"**{i+1}. {entry['name']}** — {entry.get('points',0)} pts"
-                      for i, entry in enumerate(sorted_lb[:10])])
+    desc = "\n".join([f"**{i+1}. {entry['name']}** — {entry.get('points',0)} pts" for i,entry in enumerate(sorted_lb[:10])])
     embed = discord.Embed(title="🏆 Leaderboard", description=desc, color=discord.Color.gold())
     await interaction.response.send_message(embed=embed)
 
