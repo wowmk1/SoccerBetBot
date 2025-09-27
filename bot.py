@@ -51,30 +51,22 @@ BASE_URL = "https://api.football-data.org/v4/competitions/"
 HEADERS = {"X-Auth-Token": FOOTBALL_DATA_API_KEY}
 COMPETITIONS = ["PL", "CL", "BL1", "PD", "FL1", "SA", "EC", "WC"]
 
-# ==== TRACK VOTES SEPARATELY ====
+# ==== TRACK VOTES ====
 vote_data = {}  # {match_msg_id: {"home": set(), "draw": set(), "away": set(), "votes_msg_id": int, "locked_users": set()}}
-
-# ==== TRACK LAST LEADERBOARD MESSAGE ====
 last_leaderboard_msg_id = None
 
-# ==== VOTE EMBED CREATOR ====
+# ==== VOTES EMBED ====
 def create_votes_embed(votes_dict):
     embed = discord.Embed(title="Current Votes", color=discord.Color.green())
-    embed.add_field(
-        name="Home",
-        value=", ".join(votes_dict["home"]) if votes_dict["home"] else "No votes yet",
-        inline=False
-    )
-    embed.add_field(
-        name="Draw",
-        value=", ".join(votes_dict["draw"]) if votes_dict["draw"] else "No votes yet",
-        inline=False
-    )
-    embed.add_field(
-        name="Away",
-        value=", ".join(votes_dict["away"]) if votes_dict["away"] else "No votes yet",
-        inline=False
-    )
+
+    home_voters = ", ".join(sorted(votes_dict["home"])) if votes_dict["home"] else "No votes yet"
+    draw_voters = ", ".join(sorted(votes_dict["draw"])) if votes_dict["draw"] else "No votes yet"
+    away_voters = ", ".join(sorted(votes_dict["away"])) if votes_dict["away"] else "No votes yet"
+
+    embed.add_field(name="Home", value=home_voters, inline=False)
+    embed.add_field(name="Draw", value=draw_voters, inline=False)
+    embed.add_field(name="Away", value=away_voters, inline=False)
+
     return embed
 
 # ==== GENERATE MATCH IMAGE ====
@@ -145,15 +137,18 @@ class VoteButton(Button):
         match_id = self.match_msg_id
 
         if match_id not in vote_data:
-            vote_data[match_id] = {"home": set(), "draw": set(), "away": set(),
-                                   "votes_msg_id": None, "locked_users": set()}
+            vote_data[match_id] = {
+                "home": set(),
+                "draw": set(),
+                "away": set(),
+                "votes_msg_id": None,
+                "locked_users": set()
+            }
 
-        # Check if user already voted
         if user.id in vote_data[match_id]["locked_users"]:
             await interaction.response.send_message("You have already voted!", ephemeral=True)
             return
 
-        # Record vote
         vote_data[match_id][self.category].add(user.name)
         vote_data[match_id]["locked_users"].add(user.id)
 
@@ -174,12 +169,7 @@ class VoteButton(Button):
         leaderboard[user_id]["predictions"][str(match_id)] = self.category
         save_leaderboard()
 
-        # Disable all buttons after vote
-        for button in self.view.children:
-            button.disabled = True
-        await interaction.message.edit(view=self.view)
         await interaction.response.defer()
-
 
 # ==== POST MATCH ====
 async def post_match(match):
@@ -210,7 +200,7 @@ async def post_match(match):
         file = discord.File(fp=image_buffer, filename="match.png")
         embed.set_image(url="attachment://match.png")
 
-    # Create buttons (plain labels)
+    # Buttons
     view = View()
     view.add_item(VoteButton(label="Home", category="home", match_msg_id=match_id))
     view.add_item(VoteButton(label="Draw", category="draw", match_msg_id=match_id))
@@ -218,7 +208,6 @@ async def post_match(match):
 
     msg = await channel.send(embed=embed, file=file, view=view)
 
-    # Initialize vote tracking
     vote_data[match_id] = {"home": set(), "draw": set(), "away": set(),
                            "votes_msg_id": None, "locked_users": set()}
     posted_matches.add(match_id)
@@ -249,7 +238,7 @@ async def update_match_results():
 
                     for uid, v in leaderboard.items():
                         if v.get("predictions", {}).get(match_id) == result:
-                            v["points"] = v.get("points", 0) + 1
+                            v["points"] = v.get("points",0)+1
                             leaderboard_changed = True
                     save_leaderboard()
 
@@ -262,11 +251,11 @@ async def update_match_results():
         if not users:
             return
 
-        sorted_lb = sorted(users, key=lambda x: (-x.get("points",0), x["name"].lower()))
+        sorted_lb = sorted(users, key=lambda x:(-x.get("points",0), x["name"].lower()))
         desc_lines = []
         for i, entry in enumerate(sorted_lb[:10]):
             uid = next(uid for uid,v in leaderboard.items() if v["name"]==entry["name"])
-            diff = entry.get("points",0) - previous_points.get(uid,0)
+            diff = entry.get("points",0)-previous_points.get(uid,0)
             suffix = f" (+{diff})" if diff>0 else ""
             desc_lines.append(f"**{i+1}. {entry['name']}** — {entry.get('points',0)} pts{suffix}")
         desc = "\n".join(desc_lines)
@@ -293,7 +282,7 @@ async def matches_command(interaction: discord.Interaction):
 
     league_dict = {}
     for m in matches:
-        league_name = m["competition"].get("name", "Unknown League")
+        league_name = m["competition"].get("name","Unknown League")
         league_dict.setdefault(league_name, []).append(m)
 
     for league_name, league_matches in league_dict.items():
@@ -310,7 +299,7 @@ async def leaderboard_command(interaction: discord.Interaction):
         await interaction.response.send_message("Leaderboard is empty.", ephemeral=True)
         return
 
-    sorted_lb = sorted(users, key=lambda x: (-x.get("points",0), x["name"].lower()))
+    sorted_lb = sorted(users, key=lambda x:(-x.get("points",0), x["name"].lower()))
     desc = "\n".join([f"**{i+1}. {entry['name']}** — {entry.get('points',0)} pts"
                       for i, entry in enumerate(sorted_lb[:10])])
     embed = discord.Embed(title="🏆 Leaderboard", description=desc, color=discord.Color.gold())
@@ -333,7 +322,7 @@ async def auto_post_matches():
 
     league_dict = {}
     for m in matches:
-        league_name = m["competition"].get("name", "Unknown League")
+        league_name = m["competition"].get("name","Unknown League")
         league_dict.setdefault(league_name, []).append(m)
 
     channel = bot.get_channel(MATCH_CHANNEL_ID)
