@@ -460,6 +460,15 @@ async def post_match(match):
         "away_team": away_team
     }
     
+    # CREATE INITIAL VOTES MESSAGE IMMEDIATELY - This keeps it grouped!
+    try:
+        initial_votes_embed = create_votes_embed(match_id)
+        votes_message = await match_message.reply(embed=initial_votes_embed, mention_author=False)
+        vote_data[match_id]["votes_msg_id"] = votes_message.id
+        print(f"Created initial votes message for match {match_id}")
+    except Exception as e:
+        print(f"Error creating initial votes message: {e}")
+    
     posted_matches.add(match_id)
     save_posted()
     
