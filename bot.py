@@ -29,42 +29,60 @@ file_lock = asyncio.Lock()
 
 # ==== LEADERBOARD ====
 LEADERBOARD_FILE = "leaderboard.json"
-if os.path.exists(LEADERBOARD_FILE):
-    with open(LEADERBOARD_FILE, "r") as f:
-        leaderboard = json.load(f)
-else:
+try:
+    if os.path.exists(LEADERBOARD_FILE):
+        with open(LEADERBOARD_FILE, "r") as f:
+            leaderboard = json.load(f)
+    else:
+        leaderboard = {}
+except (json.JSONDecodeError, IOError):
+    print("Warning: Could not load leaderboard.json, starting fresh")
     leaderboard = {}
 
-async def save_leaderboard():
-    async with file_lock:
+def save_leaderboard():
+    try:
         with open(LEADERBOARD_FILE, "w") as f:
             json.dump(leaderboard, f)
+    except Exception as e:
+        print(f"Error saving leaderboard: {e}")
 
 # ==== TRACK POSTED MATCHES ====
 POSTED_FILE = "posted_matches.json"
-if os.path.exists(POSTED_FILE):
-    with open(POSTED_FILE, "r") as f:
-        posted_matches = set(json.load(f))
-else:
+try:
+    if os.path.exists(POSTED_FILE):
+        with open(POSTED_FILE, "r") as f:
+            posted_matches = set(json.load(f))
+    else:
+        posted_matches = set()
+except (json.JSONDecodeError, IOError):
+    print("Warning: Could not load posted_matches.json, starting fresh")
     posted_matches = set()
 
-async def save_posted():
-    async with file_lock:
+def save_posted():
+    try:
         with open(POSTED_FILE, "w") as f:
             json.dump(list(posted_matches), f)
+    except Exception as e:
+        print(f"Error saving posted matches: {e}")
 
 # ==== TRACK PROCESSED MATCHES (CRITICAL FIX) ====
 PROCESSED_MATCHES_FILE = "processed_matches.json"
-if os.path.exists(PROCESSED_MATCHES_FILE):
-    with open(PROCESSED_MATCHES_FILE, "r") as f:
-        processed_matches = set(json.load(f))
-else:
+try:
+    if os.path.exists(PROCESSED_MATCHES_FILE):
+        with open(PROCESSED_MATCHES_FILE, "r") as f:
+            processed_matches = set(json.load(f))
+    else:
+        processed_matches = set()
+except (json.JSONDecodeError, IOError):
+    print("Warning: Could not load processed_matches.json, starting fresh")
     processed_matches = set()
 
-async def save_processed_matches():
-    async with file_lock:
+def save_processed_matches():
+    try:
         with open(PROCESSED_MATCHES_FILE, "w") as f:
             json.dump(list(processed_matches), f)
+    except Exception as e:
+        print(f"Error saving processed matches: {e}")
 
 # ==== FOOTBALL API ====
 BASE_URL = "https://api.football-data.org/v4/competitions/"
@@ -75,6 +93,9 @@ COMPETITIONS = ["PL", "CL", "BL1", "PD", "FL1", "SA", "EC", "WC"]
 vote_data = {}  # match_id: {"home": set(), "draw": set(), "away": set(), "votes_msg_id": int, "locked_users": set(), "buttons_disabled": bool, "match_msg_id": int, "kickoff_time": datetime, "home_team": str, "away_team": str}
 last_leaderboard_msg_id = None
 active_views = {}  # Store active views by match_id
+
+# Global lock to prevent race conditions in point calculation
+point_calculation_lock = asyncio.Lock()
 
 # ==== VOTES EMBED CREATION ====
 def create_votes_embed(match_id, match_result=None, final_score=None):
@@ -215,7 +236,7 @@ async def generate_match_image(home_url, away_url):
 # ==== FETCH MATCHES (NEXT 48H) ====
 async def fetch_matches():
     now = datetime.now(timezone.utc)
-    next_48h = now + timedelta(hours=48)  # Extended to 48 hours
+    next_48h = now + timedelta(hours=48)
     matches_by_competition = {}
     
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
@@ -231,7 +252,7 @@ async def fetch_matches():
                         for m in data.get("matches", []):
                             try:
                                 match_time = datetime.fromisoformat(m['utcDate'].replace("Z", "+00:00"))
-                                if now <= match_time <= next_48h:  # Check within 48 hours
+                                if now <= match_time <= next_48h:
                                     m["competition"]["name"] = competition_name
                                     comp_matches.append(m)
                             except:
@@ -242,18 +263,6 @@ async def fetch_matches():
                             
             except Exception as e:
                 print(f"Error fetching {comp} matches: {e}")
-                
-    # If no matches found, add fallback
-    if not matches_by_competition:
-        matches_by_competition["Fallback League"] = [
-            {
-                "id": 88801,
-                "utcDate": (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat(),
-                "homeTeam": {"name": "Fallback Team A", "crest": None},
-                "awayTeam": {"name": "Fallback Team B", "crest": None},
-                "competition": {"name": "Fallback League"}
-            }
-        ]
     
     return matches_by_competition
 
@@ -327,13 +336,13 @@ class PersistentMatchView(View):
             vote_data[match_id][vote_type].add(user.display_name)
             vote_data[match_id]["locked_users"].add(user_id)
             
-            # Update leaderboard data
+            # Update leaderboard data (synchronous)
             user_id_str = str(user_id)
             if user_id_str not in leaderboard:
                 leaderboard[user_id_str] = {"name": user.display_name, "points": 0, "predictions": {}}
             leaderboard[user_id_str]["predictions"][match_id] = vote_type
-            leaderboard[user_id_str]["name"] = user.display_name  # Update name in case it changed
-            await save_leaderboard()
+            leaderboard[user_id_str]["name"] = user.display_name
+            save_leaderboard()
             
             # Create/update votes embed immediately after the match message
             embed = create_votes_embed(match_id)
@@ -345,7 +354,6 @@ class PersistentMatchView(View):
                     votes_message = await interaction.channel.fetch_message(votes_msg_id)
                     await votes_message.edit(embed=embed)
                 except discord.NotFound:
-                    # Message was deleted, create new one as reply to match message
                     try:
                         match_message = await interaction.channel.fetch_message(match_msg_id)
                         votes_message = await match_message.reply(embed=embed, mention_author=False)
@@ -353,14 +361,12 @@ class PersistentMatchView(View):
                     except Exception as e:
                         print(f"Error creating votes reply: {e}")
             else:
-                # Create first votes message as reply to match message - this keeps it grouped!
                 try:
                     match_message = await interaction.channel.fetch_message(match_msg_id)
                     votes_message = await match_message.reply(embed=embed, mention_author=False)
                     vote_data[match_id]["votes_msg_id"] = votes_message.id
                 except Exception as e:
                     print(f"Error creating votes reply: {e}")
-                    # Only fallback to bottom posting if reply completely fails
                     votes_message = await interaction.channel.send(embed=embed)
                     vote_data[match_id]["votes_msg_id"] = votes_message.id
             
@@ -379,7 +385,6 @@ class PersistentMatchView(View):
             )
             
         except discord.InteractionResponded:
-            # Already responded somehow
             pass
         except Exception as e:
             print(f"Error in vote handling: {e}")
@@ -478,7 +483,7 @@ async def post_match(match):
         "away_team": away_team
     }
     
-    # CREATE INITIAL VOTES MESSAGE IMMEDIATELY - This keeps it grouped!
+    # CREATE INITIAL VOTES MESSAGE IMMEDIATELY
     try:
         initial_votes_embed = create_votes_embed(match_id)
         votes_message = await match_message.reply(embed=initial_votes_embed, mention_author=False)
@@ -488,14 +493,13 @@ async def post_match(match):
         print(f"Error creating initial votes message: {e}")
     
     posted_matches.add(match_id)
-    await save_posted()
+    save_posted()
     
     print(f"Posted match: {home_team} vs {away_team} (ID: {match_id})")
 
 # ==== CHECK AND DISABLE EXPIRED VOTES ====
 @tasks.loop(minutes=2)
 async def check_voting_status():
-    """Check if any matches need their voting disabled"""
     if not vote_data:
         return
         
@@ -515,14 +519,12 @@ async def check_voting_status():
             
         voting_cutoff = kickoff_time - timedelta(minutes=10)
         
-        # If voting should be closed
         if now >= voting_cutoff:
             try:
                 match_msg_id = data.get("match_msg_id")
                 if match_msg_id:
                     match_message = await channel.fetch_message(match_msg_id)
                     
-                    # Create disabled view
                     disabled_view = View(timeout=None)
                     disabled_view.add_item(Button(label="🏠 Home", style=discord.ButtonStyle.secondary, disabled=True))
                     disabled_view.add_item(Button(label="🤝 Draw", style=discord.ButtonStyle.secondary, disabled=True)) 
@@ -540,118 +542,140 @@ async def check_voting_status():
 @tasks.loop(minutes=5)
 async def update_match_results():
     global last_leaderboard_msg_id
-    leaderboard_changed = False
-    previous_points = {uid: v.get("points", 0) for uid, v in leaderboard.items()}
     
-    # Fetch finished matches and update points
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
-        for comp in COMPETITIONS:
+    # Use lock to prevent race conditions
+    async with point_calculation_lock:
+        leaderboard_changed = False
+        previous_points = {uid: v.get("points", 0) for uid, v in leaderboard.items()}
+        processed_this_cycle = set()  # Track what we process this cycle
+        
+        # Collect all finished matches first to avoid processing duplicates
+        finished_matches = {}
+        
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
+            for comp in COMPETITIONS:
+                try:
+                    url = f"{BASE_URL}{comp}/matches"
+                    async with session.get(url, headers=HEADERS) as resp:
+                        if resp.status != 200:
+                            continue
+                            
+                        data = await resp.json()
+                        for m in data.get("matches", []):
+                            match_id = str(m["id"])
+                            status = m.get("status")
+                            
+                            if status != "FINISHED":
+                                continue
+                                
+                            # Skip if already processed OR already seen this cycle
+                            if match_id in processed_matches or match_id in processed_this_cycle:
+                                continue
+                                
+                            if match_id not in vote_data:
+                                continue
+                                
+                            finished_matches[match_id] = m
+                            processed_this_cycle.add(match_id)
+                            
+                except Exception as e:
+                    print(f"Error checking results for {comp}: {e}")
+        
+        # Now process each unique finished match
+        for match_id, m in finished_matches.items():
             try:
-                url = f"{BASE_URL}{comp}/matches"
-                async with session.get(url, headers=HEADERS) as resp:
-                    if resp.status != 200:
-                        continue
+                score = m.get("score", {})
+                winner = score.get("winner")
+                
+                if not winner:
+                    continue
+                    
+                # Convert API result to our format
+                if winner == "HOME_TEAM":
+                    result = "home"
+                elif winner == "AWAY_TEAM": 
+                    result = "away"
+                elif winner == "DRAW":
+                    result = "draw"
+                else:
+                    continue
+                    
+                # Award points to correct predictors (ONLY ONCE)
+                points_awarded = False
+                for uid, user_data in leaderboard.items():
+                    prediction = user_data.get("predictions", {}).get(match_id)
+                    if prediction == result:
+                        user_data["points"] = user_data.get("points", 0) + 1
+                        leaderboard_changed = True
+                        points_awarded = True
                         
-                    data = await resp.json()
-                    for m in data.get("matches", []):
-                        match_id = str(m["id"])
-                        status = m.get("status")
-                        
-                        if status != "FINISHED":
-                            continue
+                if points_awarded:
+                    save_leaderboard()
+                    
+                # Mark match as processed to prevent duplicate points
+                processed_matches.add(match_id)
+                save_processed_matches()
+                
+                print(f"Processed match {match_id} - awarded points for {result} result")
+                
+                # Update votes display with result
+                try:
+                    votes_msg_id = vote_data[match_id].get("votes_msg_id")
+                    if votes_msg_id:
+                        channel = bot.get_channel(MATCH_CHANNEL_ID)
+                        if channel:
+                            votes_message = await channel.fetch_message(votes_msg_id)
                             
-                        # CRITICAL FIX: Skip if already processed
-                        if match_id in processed_matches:
-                            continue
+                            # Get final score for display
+                            final_score = None
+                            fulltime_score = score.get("fullTime", {})
+                            if fulltime_score.get("home") is not None and fulltime_score.get("away") is not None:
+                                final_score = f"{fulltime_score['home']} - {fulltime_score['away']}"
                             
-                        score = m.get("score", {})
-                        winner = score.get("winner")
-                        
-                        if not winner or match_id not in vote_data:
-                            continue
+                            result_embed = create_votes_embed(match_id, match_result=result, final_score=final_score)
+                            await votes_message.edit(embed=result_embed)
                             
-                        # Convert API result to our format
-                        if winner == "HOME_TEAM":
-                            result = "home"
-                        elif winner == "AWAY_TEAM": 
-                            result = "away"
-                        elif winner == "DRAW":
-                            result = "draw"
-                        else:
-                            continue
+                    # Disable buttons if not already disabled
+                    if not vote_data[match_id].get("buttons_disabled"):
+                        match_msg_id = vote_data[match_id].get("match_msg_id")
+                        if match_msg_id and channel:
+                            match_message = await channel.fetch_message(match_msg_id)
                             
-                        # Award points to correct predictors (ONLY ONCE)
-                        points_awarded = False
-                        for uid, user_data in leaderboard.items():
-                            prediction = user_data.get("predictions", {}).get(match_id)
-                            if prediction == result:
-                                user_data["points"] = user_data.get("points", 0) + 1
-                                leaderboard_changed = True
-                                points_awarded = True
-                                
-                        if points_awarded:
-                            await save_leaderboard()
+                            # Create finished match embed update
+                            original_embed = match_message.embeds[0]
+                            finished_embed = discord.Embed(
+                                title=f"🏁 FINISHED: {original_embed.title[2:]}",
+                                description=original_embed.description.replace("🗳️ **Voting closes", "🔒 **Voting closed"),
+                                color=discord.Color.dark_gray()
+                            )
                             
-                        # Mark match as processed to prevent duplicate points
-                        processed_matches.add(match_id)
-                        await save_processed_matches()
-                        
-                        print(f"Processed match {match_id} - awarded points for {result} result")
-                        
-                        # Update votes display with result
-                        try:
-                            votes_msg_id = vote_data[match_id].get("votes_msg_id")
-                            if votes_msg_id:
-                                channel = bot.get_channel(MATCH_CHANNEL_ID)
-                                votes_message = await channel.fetch_message(votes_msg_id)
-                                
-                                # Get final score for display
-                                final_score = None
-                                fulltime_score = score.get("fullTime", {})
-                                if fulltime_score.get("home") is not None and fulltime_score.get("away") is not None:
-                                    final_score = f"{fulltime_score['home']} - {fulltime_score['away']}"
-                                
-                                result_embed = create_votes_embed(match_id, match_result=result, final_score=final_score)
-                                await votes_message.edit(embed=result_embed)
-                                
-                            # Disable buttons if not already disabled
-                            if not vote_data[match_id].get("buttons_disabled"):
-                                match_msg_id = vote_data[match_id].get("match_msg_id")
-                                if match_msg_id:
-                                    match_message = await channel.fetch_message(match_msg_id)
-                                    
-                                    # Create finished match embed update
-                                    original_embed = match_message.embeds[0]
-                                    finished_embed = discord.Embed(
-                                        title=f"🏁 FINISHED: {original_embed.title[2:]}",  # Remove ⚽ and add 🏁
-                                        description=original_embed.description.replace("🗳️ **Voting closes", "🔒 **Voting closed"),
-                                        color=discord.Color.dark_gray()
-                                    )
-                                    
-                                    # Add final score to embed if available
-                                    if final_score:
-                                        finished_embed.add_field(name="⚽ Final Score", value=f"**{final_score}**", inline=True)
-                                    
-                                    # Copy other fields but mark as finished
-                                    for field in original_embed.fields:
-                                        if field.name == "🔥 Status":
-                                            finished_embed.add_field(name="🏁 Status", value="**FINISHED**", inline=True)
-                                        elif field.name not in ["📅 Status", "⏱️ Voting"]:
-                                            finished_embed.add_field(name=field.name, value=field.value, inline=field.inline)
-                                    
-                                    disabled_view = View(timeout=None)
-                                    disabled_view.add_item(Button(label="🏠 Home", style=discord.ButtonStyle.secondary, disabled=True))
-                                    disabled_view.add_item(Button(label="🤝 Draw", style=discord.ButtonStyle.secondary, disabled=True))
-                                    disabled_view.add_item(Button(label="✈️ Away", style=discord.ButtonStyle.secondary, disabled=True))
-                                    
-                                    await match_message.edit(embed=finished_embed, view=disabled_view)
-                                    vote_data[match_id]["buttons_disabled"] = True
-                                    
-                        except Exception as e:
-                            print(f"Error updating match result display for {match_id}: {e}")
+                            # Add final score to embed if available
+                            final_score = None
+                            fulltime_score = score.get("fullTime", {})
+                            if fulltime_score.get("home") is not None and fulltime_score.get("away") is not None:
+                                final_score = f"{fulltime_score['home']} - {fulltime_score['away']}"
+                                finished_embed.add_field(name="⚽ Final Score", value=f"**{final_score}**", inline=True)
                             
+                            # Copy other fields but mark as finished
+                            for field in original_embed.fields:
+                                if field.name == "🔥 Status":
+                                    finished_embed.add_field(name="🏁 Status", value="**FINISHED**", inline=True)
+                                elif field.name not in ["📅 Status", "⏱️ Voting"]:
+                                    finished_embed.add_field(name=field.name, value=field.value, inline=field.inline)
+                            
+                            disabled_view = View(timeout=None)
+                            disabled_view.add_item(Button(label="🏠 Home", style=discord.ButtonStyle.secondary, disabled=True))
+                            disabled_view.add_item(Button(label="🤝 Draw", style=discord.ButtonStyle.secondary, disabled=True))
+                            disabled_view.add_item(Button(label="✈️ Away", style=discord.ButtonStyle.secondary, disabled=True))
+                            
+                            await match_message.edit(embed=finished_embed, view=disabled_view)
+                            vote_data[match_id]["buttons_disabled"] = True
+                            
+                except Exception as e:
+                    print(f"Error updating match result display for {match_id}: {e}")
+                    
             except Exception as e:
-                print(f"Error checking results for {comp}: {e}")
+                print(f"Error processing finished match {match_id}: {e}")
     
     # Update leaderboard message if there were changes
     if leaderboard_changed:
@@ -666,13 +690,15 @@ async def update_match_results():
         sorted_lb = sorted(users, key=lambda x: (-x.get("points", 0), x["name"].lower()))
         desc_lines = []
         
-        for i, entry in enumerate(sorted_lb[:15]):  # Show top 15 instead of 10
-            uid = next(uid for uid, v in leaderboard.items() if v["name"] == entry["name"])
+        for i, entry in enumerate(sorted_lb[:15]):
+            uid = next((uid for uid, v in leaderboard.items() if v["name"] == entry["name"]), None)
+            if not uid:
+                continue
+                
             current_points = entry.get("points", 0)
             previous = previous_points.get(uid, 0)
             diff = current_points - previous
             
-            # Enhanced ranking with medals and point changes
             if i == 0:
                 rank_emoji = "🥇"
             elif i == 1:
@@ -687,7 +713,6 @@ async def update_match_results():
             suffix = f" 🔥**(+{diff})**" if diff > 0 else ""
             desc_lines.append(f"{rank_emoji} {entry['name']} — **{current_points}** pts{suffix}")
         
-        # Add statistics footer
         total_predictions = sum(len(v.get("predictions", {})) for v in leaderboard.values())
         active_players = len([v for v in leaderboard.values() if v.get("predictions")])
         
@@ -699,7 +724,6 @@ async def update_match_results():
         )
         embed.set_footer(text=f"👥 {active_players} players • 📊 {total_predictions} total predictions • Last updated")
         
-        # Add podium field for top 3
         if len(sorted_lb) >= 3:
             podium_text = (
                 f"🥇 **{sorted_lb[0]['name']}** - {sorted_lb[0].get('points', 0)} pts\n"
@@ -736,12 +760,10 @@ async def matches_command(interaction: discord.Interaction):
             
         total_posted = 0
         
-        # Post matches organized by competition
         for competition_name, matches in matches_by_competition.items():
             if not matches:
                 continue
                 
-            # Post competition header
             header_embed = discord.Embed(
                 title=f"🏆 {competition_name}",
                 description=f"📅 {len(matches)} match{'es' if len(matches) != 1 else ''} upcoming",
@@ -749,7 +771,6 @@ async def matches_command(interaction: discord.Interaction):
             )
             await channel.send(embed=header_embed)
             
-            # Post each match in this competition
             for match in matches:
                 try:
                     await post_match(match)
@@ -777,7 +798,6 @@ async def leaderboard_command(interaction: discord.Interaction):
         
     sorted_lb = sorted(users, key=lambda x: (-x.get("points", 0), x["name"].lower()))
     
-    # Enhanced leaderboard display
     desc_lines = []
     for i, entry in enumerate(sorted_lb[:15]):
         if i == 0:
@@ -822,7 +842,6 @@ async def my_votes_command(interaction: discord.Interaction):
         color=discord.Color.blue()
     )
     
-    # Show active predictions (matches that haven't started yet)
     active_predictions = []
     finished_predictions = []
     
@@ -873,7 +892,7 @@ async def match_status_command(interaction: discord.Interaction):
         if not kickoff_time:
             continue
             
-        if now < kickoff_time:  # Only show upcoming matches
+        if now < kickoff_time:
             home_team = data.get("home_team", "Unknown")
             away_team = data.get("away_team", "Unknown")
             
@@ -912,13 +931,11 @@ async def match_status_command(interaction: discord.Interaction):
 
 @bot.tree.command(name="stats", description="Show bot statistics and recent activity.")
 async def stats_command(interaction: discord.Interaction):
-    # Calculate statistics
     total_users = len([v for v in leaderboard.values() if v.get("predictions")])
     total_predictions = sum(len(v.get("predictions", {})) for v in leaderboard.values())
     active_matches = len([m for m in vote_data.values() if datetime.now(timezone.utc) < m.get("kickoff_time", datetime.now(timezone.utc))])
     finished_matches = len([m for m in vote_data.values() if datetime.now(timezone.utc) >= m.get("kickoff_time", datetime.now(timezone.utc))])
     
-    # Most active predictor
     most_active = None
     max_predictions = 0
     for user_data in leaderboard.values():
@@ -927,7 +944,6 @@ async def stats_command(interaction: discord.Interaction):
             max_predictions = pred_count
             most_active = user_data.get("name", "Unknown")
     
-    # Top scorer
     top_scorer = None
     max_points = 0
     for user_data in leaderboard.values():
@@ -960,7 +976,6 @@ async def stats_command(interaction: discord.Interaction):
         inline=True
     )
     
-    # Recent activity
     now = datetime.now(timezone.utc)
     upcoming_today = []
     for match_id, data in vote_data.items():
@@ -1028,20 +1043,28 @@ async def help_command(interaction: discord.Interaction):
     
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
-@bot.tree.command(name="test_matches", description="Post test matches for voting (15min and 2hr from now).")
+@bot.tree.command(name="test_matches", description="Post test matches for voting.")
 async def test_matches_command(interaction: discord.Interaction):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Admin only command.", ephemeral=True)
+        return
+        
     await interaction.response.defer(ephemeral=True)
+    
+    import random
+    test_id_1 = random.randint(900000, 999999)
+    test_id_2 = random.randint(900000, 999999)
     
     test_matches = [
         {
-            "id": 99901,
+            "id": test_id_1,
             "utcDate": (datetime.now(timezone.utc) + timedelta(minutes=15)).isoformat(),
             "homeTeam": {"name": "Test Team A", "crest": None},
             "awayTeam": {"name": "Test Team B", "crest": None},
             "competition": {"name": "Test League"}
         },
         {
-            "id": 99902, 
+            "id": test_id_2,
             "utcDate": (datetime.now(timezone.utc) + timedelta(hours=2)).isoformat(),
             "homeTeam": {"name": "Test Team C", "crest": None},
             "awayTeam": {"name": "Test Team D", "crest": None},
@@ -1052,9 +1075,8 @@ async def test_matches_command(interaction: discord.Interaction):
     for match in test_matches:
         await post_match(match)
         
-    await interaction.followup.send("✅ Test matches posted!", ephemeral=True)
+    await interaction.followup.send(f"✅ Test matches posted! IDs: {test_id_1}, {test_id_2}", ephemeral=True)
 
-# ==== DEBUG COMMANDS ====
 @bot.tree.command(name="debug_points", description="Debug point calculation issues (Admin only).")
 async def debug_points_command(interaction: discord.Interaction):
     if not interaction.user.guild_permissions.administrator:
@@ -1075,7 +1097,6 @@ async def debug_points_command(interaction: discord.Interaction):
     embed.add_field(name="Total Predictions", value=str(len(predictions)), inline=True)
     embed.add_field(name="Processed Matches", value=str(len(processed_matches)), inline=True)
     
-    # Show which matches were processed for points
     user_processed = 0
     for match_id in predictions:
         if match_id in processed_matches:
@@ -1094,19 +1115,17 @@ async def reset_points_command(interaction: discord.Interaction):
     
     await interaction.response.defer(ephemeral=True)
     
-    # Reset all points to 0
     for user_data in leaderboard.values():
         user_data["points"] = 0
     
-    # Clear processed matches to allow recalculation
     processed_matches.clear()
     
-    await save_leaderboard()
-    await save_processed_matches()
+    save_leaderboard()
+    save_processed_matches()
     
     await interaction.followup.send("✅ Points reset. They'll be recalculated on the next update cycle (within 5 minutes).", ephemeral=True)
 
-# ==== DAILY MATCH SCHEDULER ====
+# ==== SCHEDULER ====
 scheduler = AsyncIOScheduler()
 
 async def daily_fetch_matches():
@@ -1119,12 +1138,10 @@ async def daily_fetch_matches():
             
         total_posted = 0
         
-        # Post matches organized by competition
         for competition_name, matches in matches_by_competition.items():
             if not matches:
                 continue
                 
-            # Post competition header
             header_embed = discord.Embed(
                 title=f"🏆 {competition_name}",
                 description=f"📅 {len(matches)} match{'es' if len(matches) != 1 else ''} in next 48h",
@@ -1132,7 +1149,6 @@ async def daily_fetch_matches():
             )
             await channel.send(embed=header_embed)
             
-            # Post each match in this competition
             for match in matches:
                 await post_match(match)
                 total_posted += 1
@@ -1141,11 +1157,10 @@ async def daily_fetch_matches():
     except Exception as e:
         print(f"Error in daily fetch: {e}")
 
-# Changed scheduler to run every 12 hours instead of daily to better capture 48h window
 scheduler.add_job(
     lambda: bot.loop.create_task(daily_fetch_matches()), 
     "cron", 
-    hour="6,18",  # Run at 6 AM and 6 PM UTC
+    hour="6,18",
     minute=0,
     timezone="UTC"
 )
@@ -1155,17 +1170,14 @@ scheduler.add_job(
 async def on_ready():
     print(f"Bot logged in as {bot.user}")
     
-    # Add persistent views
     bot.add_view(PersistentMatchView())
     
-    # Sync commands
     try:
         synced = await bot.tree.sync()
         print(f"Synced {len(synced)} commands")
     except Exception as e:
         print(f"Failed to sync commands: {e}")
     
-    # Start tasks
     if not update_match_results.is_running():
         update_match_results.start()
         print("Started match results task")
@@ -1178,7 +1190,6 @@ async def on_ready():
         scheduler.start()
         print("Started scheduler")
 
-# ==== ERROR HANDLING ====
 @bot.event
 async def on_error(event, *args, **kwargs):
     print(f"Bot error in {event}: {args}")
