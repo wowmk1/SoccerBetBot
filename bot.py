@@ -37,13 +37,13 @@ def save_leaderboard():
 # ==== FOOTBALL API ====
 BASE_URL = "https://api.football-data.org/v4/competitions/"
 HEADERS = {"X-Auth-Token": FOOTBALL_DATA_API_KEY}
-COMPETITIONS = ["PL", "CL", "BL1", "PD", "FL1", "SA", "EC", "WC"]  # excluded DED, ELC, PPL
+COMPETITIONS = ["PL", "CL", "BL1", "PD", "FL1", "SA", "EC", "WC"]  # exclude DED, ELC, PPL
 
-# ==== VOTE EMOJIS ====
+# ==== VOTE EMOJIS (CUSTOM SERVER EMOJIS) ====
 VOTE_EMOJIS = {
-    "🏠": "HOME_TEAM",
-    "⚖️": "DRAW",
-    "🛫": "AWAY_TEAM"
+    "home": "HOME_TEAM",
+    "draw": "DRAW",
+    "away": "AWAY_TEAM"
 }
 
 # ==== MATCH IMAGE ====
@@ -130,9 +130,12 @@ async def post_match(match):
         bot.match_times = {}
     bot.match_times[str(msg.id)] = match_time
 
-    # Add vote reactions
-    for emoji in VOTE_EMOJIS:
-        await msg.add_reaction(emoji)
+    # Add custom emoji reactions
+    guild = channel.guild
+    for emoji_name in VOTE_EMOJIS.keys():
+        emoji = discord.utils.get(guild.emojis, name=emoji_name)
+        if emoji:
+            await msg.add_reaction(emoji)
 
 # ==== REACTION HANDLER ====
 @bot.event
@@ -141,14 +144,18 @@ async def on_raw_reaction_add(payload):
         return
 
     channel = bot.get_channel(payload.channel_id)
+    if not channel:
+        return
+
     message = await channel.fetch_message(payload.message_id)
     match_id = str(message.id)
 
-    # Remove any invalid reactions immediately
-    if str(payload.emoji) not in VOTE_EMOJIS:
-        user = await bot.fetch_user(payload.user_id)
+    # Check custom emoji
+    emoji_name = payload.emoji.name
+    if emoji_name not in VOTE_EMOJIS:
+        # remove invalid reactions
         async for react in message.reactions:
-            if react.emoji == str(payload.emoji):
+            if getattr(react.emoji, "name", None) == emoji_name:
                 async for u in react.users():
                     if u.id == payload.user_id:
                         await react.remove(u)
@@ -166,12 +173,12 @@ async def on_raw_reaction_add(payload):
 
     # Enforce one vote per user
     for react in message.reactions:
-        if str(react.emoji) != str(payload.emoji):
+        if getattr(react.emoji, "name", None) != emoji_name:
             async for u in react.users():
                 if u.id == payload.user_id:
                     await react.remove(u)
 
-    leaderboard[user_id]["predictions"][match_id] = VOTE_EMOJIS[str(payload.emoji)]
+    leaderboard[user_id]["predictions"][match_id] = VOTE_EMOJIS[emoji_name]
     save_leaderboard()
 
     # Update embed with voter names
