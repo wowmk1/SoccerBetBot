@@ -37,7 +37,7 @@ def save_leaderboard():
 # ==== FOOTBALL API ====
 BASE_URL = "https://api.football-data.org/v4/competitions/"
 HEADERS = {"X-Auth-Token": FOOTBALL_DATA_API_KEY}
-COMPETITIONS = ["PL", "CL", "BL1", "PD", "FL1", "SA", "EC", "WC"]  # excluded DED, ELC, PPL
+COMPETITIONS = ["PL", "CL", "BL1", "PD", "FL1", "SA", "EC", "WC"]
 
 # ==== VOTE EMOJIS (CUSTOM SERVER EMOJIS) ====
 VOTE_EMOJIS = {
@@ -76,14 +76,14 @@ async def generate_match_image(home_url, away_url):
     return buffer
 
 # ==== FETCH MATCHES ====
-async def fetch_matches():
+async def fetch_matches(days_ahead=1):
     now = datetime.now(timezone.utc)
-    tomorrow = now + timedelta(days=1)
+    future = now + timedelta(days=days_ahead)
     matches = []
 
     async with aiohttp.ClientSession() as session:
         for comp in COMPETITIONS:
-            url = f"{BASE_URL}{comp}/matches?dateFrom={now.date()}&dateTo={tomorrow.date()}"
+            url = f"{BASE_URL}{comp}/matches?dateFrom={now.date()}&dateTo={future.date()}"
             async with session.get(url, headers=HEADERS) as resp:
                 if resp.status == 200:
                     data = await resp.json()
@@ -164,7 +164,7 @@ async def on_raw_reaction_add(payload):
     # Check match time
     match_time = bot.match_times.get(match_id)
     if not match_time or match_time < datetime.now(timezone.utc):
-        return  # Match started/finished
+        return
 
     user_id = str(payload.user_id)
     user = await bot.fetch_user(payload.user_id)
@@ -181,14 +181,25 @@ async def on_raw_reaction_add(payload):
     leaderboard[user_id]["predictions"][match_id] = VOTE_EMOJIS[emoji_name]
     save_leaderboard()
 
-    # Update embed with voter names
+    # Update embed with voter names without duplicating the image
     voter_names = [v["name"] for uid, v in leaderboard.items() if match_id in v.get("predictions", {})]
     embed = message.embeds[0]
     kickoff_line = embed.description.split("Kickoff:")[1].splitlines()[0]
-    embed.description = f"Kickoff: {kickoff_line}"
+
+    new_desc = f"Kickoff: {kickoff_line}"
     if voter_names:
-        embed.description += "\n\n**Voted:** " + ", ".join(voter_names)
-    await message.edit(embed=embed)
+        new_desc += "\n\n**Voted:** " + ", ".join(voter_names)
+
+    # Create a new embed preserving image
+    new_embed = discord.Embed(
+        title=embed.title,
+        description=new_desc,
+        color=embed.color
+    )
+    if embed.image.url:
+        new_embed.set_image(url=embed.image.url)
+
+    await message.edit(embed=new_embed)
 
 # ==== CHECK FINISHED MATCHES & AWARD POINTS ====
 @tasks.loop(minutes=5)
@@ -205,11 +216,9 @@ async def update_match_results():
                     status = m.get("status")
                     if status != "FINISHED":
                         continue
-                    result = m.get("score", {}).get("winner")  # HOME_TEAM, DRAW, AWAY_TEAM
+                    result = m.get("score", {}).get("winner")
                     if not result:
                         continue
-
-                    # Award points
                     for uid, v in leaderboard.items():
                         if v.get("predictions", {}).get(match_id) == result:
                             v["points"] = v.get("points", 0) + 1
@@ -218,7 +227,7 @@ async def update_match_results():
 # ==== COMMANDS ====
 @bot.tree.command(name="matches", description="Show upcoming matches.")
 async def matches_command(interaction: discord.Interaction):
-    matches = await fetch_matches()
+    matches = await fetch_matches(days_ahead=7)
     if not matches:
         await interaction.response.send_message("No upcoming matches.", ephemeral=True)
         return
@@ -259,7 +268,7 @@ async def on_ready():
 # ==== AUTO POST MATCHES ====
 @tasks.loop(minutes=30)
 async def auto_post_matches():
-    matches = await fetch_matches()
+    matches = await fetch_matches(days_ahead=7)
     if not matches:
         return
 
