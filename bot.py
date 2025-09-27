@@ -6,6 +6,7 @@ from io import BytesIO
 from PIL import Image
 import discord
 from discord.ext import commands, tasks
+from discord.ui import View, Button
 
 # ==== ENV VARIABLES ====
 DISCORD_BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN")
@@ -19,7 +20,6 @@ if not all([DISCORD_BOT_TOKEN, FOOTBALL_DATA_API_KEY, MATCH_CHANNEL_ID, LEADERBO
 # ==== BOT SETUP ====
 intents = discord.Intents.default()
 intents.message_content = True
-intents.reactions = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # ==== LEADERBOARD ====
@@ -59,11 +59,12 @@ VOTE_EMOJIS = {
 }
 
 # ==== TRACK VOTES SEPARATELY ====
-vote_data = {}  # {match_msg_id: {"home": set(), "draw": set(), "away": set(), "votes_msg_id": int}}
+vote_data = {}  # {match_msg_id: {"home": set(), "draw": set(), "away": set(), "votes_msg_id": int, "locked_users": set()}}
 
 # ==== TRACK LAST LEADERBOARD MESSAGE ====
 last_leaderboard_msg_id = None
 
+# ==== VOTE EMBED CREATOR ====
 def create_votes_embed(votes_dict):
     embed = discord.Embed(title="Current Votes", color=discord.Color.green())
     embed.add_field(
@@ -139,11 +140,57 @@ async def fetch_matches():
         if now <= datetime.fromisoformat(m['utcDate'].replace("Z", "+00:00")) <= next_24h
     ]
 
+# ==== BUTTON CLASS ====
+class VoteButton(Button):
+    def __init__(self, label, emoji, category, match_msg_id):
+        super().__init__(label=label, emoji=emoji, style=discord.ButtonStyle.primary)
+        self.category = category
+        self.match_msg_id = match_msg_id
+
+    async def callback(self, interaction: discord.Interaction):
+        user = interaction.user
+        match_id = self.match_msg_id
+
+        if match_id not in vote_data:
+            vote_data[match_id] = {"home": set(), "draw": set(), "away": set(), "votes_msg_id": None, "locked_users": set()}
+
+        # Check if user already voted
+        if user.id in vote_data[match_id]["locked_users"]:
+            await interaction.response.send_message("You have already voted!", ephemeral=True)
+            return
+
+        # Record vote
+        vote_data[match_id][self.category].add(user.name)
+        vote_data[match_id]["locked_users"].add(user.id)
+
+        # Update votes embed
+        votes_msg_id = vote_data[match_id]["votes_msg_id"]
+        embed = create_votes_embed(vote_data[match_id])
+        if votes_msg_id:
+            votes_message = await interaction.channel.fetch_message(votes_msg_id)
+            await votes_message.edit(embed=embed)
+        else:
+            votes_message = await interaction.channel.send(embed=embed)
+            vote_data[match_id]["votes_msg_id"] = votes_message.id
+
+        # Update leaderboard
+        user_id = str(user.id)
+        if user_id not in leaderboard:
+            leaderboard[user_id] = {"name": user.name, "points": 0, "predictions": {}}
+        leaderboard[user_id]["predictions"][str(match_id)] = self.category
+        save_leaderboard()
+
+        # Disable all buttons after vote
+        for button in self.view.children:
+            button.disabled = True
+        await interaction.message.edit(view=self.view)
+        await interaction.response.defer()
+
 # ==== POST MATCH ====
 async def post_match(match):
     match_id = str(match["id"])
     if match_id in posted_matches:
-        return  # Already posted
+        return
 
     match_time = datetime.fromisoformat(match['utcDate'].replace("Z", "+00:00"))
     if match_time < datetime.now(timezone.utc):
@@ -168,89 +215,25 @@ async def post_match(match):
         file = discord.File(fp=image_buffer, filename="match.png")
         embed.set_image(url="attachment://match.png")
 
-    msg = await channel.send(embed=embed, file=file)
+    # Create buttons
+    view = View()
+    for category, emoji in VOTE_EMOJIS.items():
+        view.add_item(VoteButton(label=category.capitalize(), emoji=emoji, category=category, match_msg_id=match_id))
 
-    if not hasattr(bot, "match_times"):
-        bot.match_times = {}
-    bot.match_times[str(msg.id)] = match_time
+    msg = await channel.send(embed=embed, file=file, view=view)
 
-    guild = channel.guild
-    for emoji_name in VOTE_EMOJIS.keys():
-        emoji = discord.utils.get(guild.emojis, name=emoji_name)
-        if emoji:
-            await msg.add_reaction(emoji)
-
-    # Initialize vote tracking
-    vote_data[msg.id] = {"home": set(), "draw": set(), "away": set(), "votes_msg_id": None}
-
+    # Track votes
+    vote_data[match_id] = {"home": set(), "draw": set(), "away": set(), "votes_msg_id": None, "locked_users": set()}
     posted_matches.add(match_id)
     save_posted()
-
-# ==== REACTION HANDLER ====
-@bot.event
-async def on_raw_reaction_add(payload):
-    if payload.user_id == bot.user.id:
-        return
-
-    emoji_name = getattr(payload.emoji, "name", str(payload.emoji))
-    if emoji_name not in VOTE_EMOJIS.values():
-        return
-
-    channel = bot.get_channel(payload.channel_id)
-    if not channel:
-        return
-    message = await channel.fetch_message(payload.message_id)
-
-    # Initialize vote tracking for this match if not exists
-    if payload.message_id not in vote_data:
-        vote_data[payload.message_id] = {"home": set(), "draw": set(), "away": set(), "votes_msg_id": None}
-
-    user = await bot.fetch_user(payload.user_id)
-
-    # ---- REMOVE USER FROM ALL OTHER OPTIONS ----
-    for category in ["home", "draw", "away"]:
-        vote_data[payload.message_id][category].discard(user.name)
-    
-    # ---- ADD USER TO THE SELECTED OPTION ----
-    for key, val in VOTE_EMOJIS.items():
-        if emoji_name == val:
-            vote_data[payload.message_id][key].add(user.name)
-
-    # ---- REMOVE OTHER REACTIONS BY THE SAME USER ----
-    for react in message.reactions:
-        react_name = getattr(react.emoji, "name", str(react.emoji))
-        if react_name != emoji_name:
-            async for u in react.users():
-                if u.id == payload.user_id:
-                    await react.remove(u)
-
-    # ---- UPDATE VOTES EMBED ----
-    votes_msg_id = vote_data[payload.message_id]["votes_msg_id"]
-    embed = create_votes_embed(vote_data[payload.message_id])
-
-    if votes_msg_id:
-        try:
-            votes_message = await channel.fetch_message(votes_msg_id)
-            await votes_message.edit(embed=embed)
-        except:
-            votes_msg_id = None
-
-    if not votes_msg_id:
-        votes_message = await channel.send(embed=embed)
-        vote_data[payload.message_id]["votes_msg_id"] = votes_message.id
-
-    # ---- UPDATE LEADERBOARD ----
-    user_id = str(payload.user_id)
-    if user_id not in leaderboard:
-        leaderboard[user_id] = {"name": user.name, "points": 0, "predictions": {}}
-    leaderboard[user_id]["predictions"][str(message.id)] = emoji_name
-    save_leaderboard()
 
 # ==== UPDATE MATCH RESULTS & LEADERBOARD ====
 @tasks.loop(minutes=5)
 async def update_match_results():
     global last_leaderboard_msg_id
     leaderboard_changed = False
+    previous_points = {uid: v.get("points",0) for uid,v in leaderboard.items()}
+
     async with aiohttp.ClientSession() as session:
         for comp in COMPETITIONS:
             url = f"{BASE_URL}{comp}/matches"
@@ -282,9 +265,14 @@ async def update_match_results():
         if not users:
             return
 
-        sorted_lb = sorted(users, key=lambda x: (-x.get("points", 0), x["name"].lower()))
-        desc = "\n".join([f"**{i+1}. {entry['name']}** — {entry.get('points',0)} pts"
-                          for i, entry in enumerate(sorted_lb[:10])])
+        sorted_lb = sorted(users, key=lambda x: (-x.get("points",0), x["name"].lower()))
+        desc_lines = []
+        for i, entry in enumerate(sorted_lb[:10]):
+            uid = next(uid for uid,v in leaderboard.items() if v["name"]==entry["name"])
+            diff = entry.get("points",0) - previous_points.get(uid,0)
+            suffix = f" (+{diff})" if diff>0 else ""
+            desc_lines.append(f"**{i+1}. {entry['name']}** — {entry.get('points',0)} pts{suffix}")
+        desc = "\n".join(desc_lines)
         embed = discord.Embed(title="🏆 Leaderboard", description=desc, color=discord.Color.gold())
 
         try:
@@ -324,7 +312,8 @@ async def leaderboard_command(interaction: discord.Interaction):
     if not users:
         await interaction.response.send_message("Leaderboard is empty.", ephemeral=True)
         return
-    sorted_lb = sorted(users, key=lambda x: (-x.get("points", 0), x["name"].lower()))
+
+    sorted_lb = sorted(users, key=lambda x: (-x.get("points",0), x["name"].lower()))
     desc = "\n".join([f"**{i+1}. {entry['name']}** — {entry.get('points',0)} pts"
                       for i, entry in enumerate(sorted_lb[:10])])
     embed = discord.Embed(title="🏆 Leaderboard", description=desc, color=discord.Color.gold())
