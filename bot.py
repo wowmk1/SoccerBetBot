@@ -24,6 +24,9 @@ intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
+# ==== FILE LOCK ====
+file_lock = asyncio.Lock()
+
 # ==== LEADERBOARD ====
 LEADERBOARD_FILE = "leaderboard.json"
 if os.path.exists(LEADERBOARD_FILE):
@@ -32,9 +35,10 @@ if os.path.exists(LEADERBOARD_FILE):
 else:
     leaderboard = {}
 
-def save_leaderboard():
-    with open(LEADERBOARD_FILE, "w") as f:
-        json.dump(leaderboard, f)
+async def save_leaderboard():
+    async with file_lock:
+        with open(LEADERBOARD_FILE, "w") as f:
+            json.dump(leaderboard, f)
 
 # ==== TRACK POSTED MATCHES ====
 POSTED_FILE = "posted_matches.json"
@@ -44,9 +48,23 @@ if os.path.exists(POSTED_FILE):
 else:
     posted_matches = set()
 
-def save_posted():
-    with open(POSTED_FILE, "w") as f:
-        json.dump(list(posted_matches), f)
+async def save_posted():
+    async with file_lock:
+        with open(POSTED_FILE, "w") as f:
+            json.dump(list(posted_matches), f)
+
+# ==== TRACK PROCESSED MATCHES (CRITICAL FIX) ====
+PROCESSED_MATCHES_FILE = "processed_matches.json"
+if os.path.exists(PROCESSED_MATCHES_FILE):
+    with open(PROCESSED_MATCHES_FILE, "r") as f:
+        processed_matches = set(json.load(f))
+else:
+    processed_matches = set()
+
+async def save_processed_matches():
+    async with file_lock:
+        with open(PROCESSED_MATCHES_FILE, "w") as f:
+            json.dump(list(processed_matches), f)
 
 # ==== FOOTBALL API ====
 BASE_URL = "https://api.football-data.org/v4/competitions/"
@@ -315,7 +333,7 @@ class PersistentMatchView(View):
                 leaderboard[user_id_str] = {"name": user.display_name, "points": 0, "predictions": {}}
             leaderboard[user_id_str]["predictions"][match_id] = vote_type
             leaderboard[user_id_str]["name"] = user.display_name  # Update name in case it changed
-            save_leaderboard()
+            await save_leaderboard()
             
             # Create/update votes embed immediately after the match message
             embed = create_votes_embed(match_id)
@@ -470,7 +488,7 @@ async def post_match(match):
         print(f"Error creating initial votes message: {e}")
     
     posted_matches.add(match_id)
-    save_posted()
+    await save_posted()
     
     print(f"Posted match: {home_team} vs {away_team} (ID: {match_id})")
 
@@ -518,7 +536,7 @@ async def check_voting_status():
             except Exception as e:
                 print(f"Error disabling voting for match {match_id}: {e}")
 
-# ==== UPDATE MATCH RESULTS & LEADERBOARD ====
+# ==== UPDATE MATCH RESULTS & LEADERBOARD (FIXED) ====
 @tasks.loop(minutes=5)
 async def update_match_results():
     global last_leaderboard_msg_id
@@ -542,6 +560,10 @@ async def update_match_results():
                         if status != "FINISHED":
                             continue
                             
+                        # CRITICAL FIX: Skip if already processed
+                        if match_id in processed_matches:
+                            continue
+                            
                         score = m.get("score", {})
                         winner = score.get("winner")
                         
@@ -558,7 +580,7 @@ async def update_match_results():
                         else:
                             continue
                             
-                        # Award points to correct predictors
+                        # Award points to correct predictors (ONLY ONCE)
                         points_awarded = False
                         for uid, user_data in leaderboard.items():
                             prediction = user_data.get("predictions", {}).get(match_id)
@@ -568,8 +590,14 @@ async def update_match_results():
                                 points_awarded = True
                                 
                         if points_awarded:
-                            save_leaderboard()
+                            await save_leaderboard()
                             
+                        # Mark match as processed to prevent duplicate points
+                        processed_matches.add(match_id)
+                        await save_processed_matches()
+                        
+                        print(f"Processed match {match_id} - awarded points for {result} result")
+                        
                         # Update votes display with result
                         try:
                             votes_msg_id = vote_data[match_id].get("votes_msg_id")
@@ -999,6 +1027,7 @@ async def help_command(interaction: discord.Interaction):
     embed.set_footer(text="🎮 Good luck with your predictions!")
     
     await interaction.response.send_message(embed=embed, ephemeral=True)
+
 @bot.tree.command(name="test_matches", description="Post test matches for voting (15min and 2hr from now).")
 async def test_matches_command(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
@@ -1024,6 +1053,58 @@ async def test_matches_command(interaction: discord.Interaction):
         await post_match(match)
         
     await interaction.followup.send("✅ Test matches posted!", ephemeral=True)
+
+# ==== DEBUG COMMANDS ====
+@bot.tree.command(name="debug_points", description="Debug point calculation issues (Admin only).")
+async def debug_points_command(interaction: discord.Interaction):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Admin only command.", ephemeral=True)
+        return
+        
+    user_id = str(interaction.user.id)
+    if user_id not in leaderboard:
+        await interaction.response.send_message("No data found for your user.", ephemeral=True)
+        return
+        
+    user_data = leaderboard[user_id]
+    predictions = user_data.get("predictions", {})
+    total_points = user_data.get("points", 0)
+    
+    embed = discord.Embed(title="🔍 Point Debug", color=discord.Color.orange())
+    embed.add_field(name="Total Points", value=str(total_points), inline=True)
+    embed.add_field(name="Total Predictions", value=str(len(predictions)), inline=True)
+    embed.add_field(name="Processed Matches", value=str(len(processed_matches)), inline=True)
+    
+    # Show which matches were processed for points
+    user_processed = 0
+    for match_id in predictions:
+        if match_id in processed_matches:
+            user_processed += 1
+            
+    embed.add_field(name="Your Processed Matches", value=str(user_processed), inline=True)
+    embed.add_field(name="Expected vs Actual", value=f"{user_processed} vs {total_points}", inline=True)
+    
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@bot.tree.command(name="reset_points", description="Reset points and recalculate (Admin only).")
+async def reset_points_command(interaction: discord.Interaction):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Admin only command.", ephemeral=True)
+        return
+    
+    await interaction.response.defer(ephemeral=True)
+    
+    # Reset all points to 0
+    for user_data in leaderboard.values():
+        user_data["points"] = 0
+    
+    # Clear processed matches to allow recalculation
+    processed_matches.clear()
+    
+    await save_leaderboard()
+    await save_processed_matches()
+    
+    await interaction.followup.send("✅ Points reset. They'll be recalculated on the next update cycle (within 5 minutes).", ephemeral=True)
 
 # ==== DAILY MATCH SCHEDULER ====
 scheduler = AsyncIOScheduler()
