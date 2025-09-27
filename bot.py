@@ -259,30 +259,32 @@ class PersistentMatchView(View):
             leaderboard[user_id_str]["name"] = user.display_name  # Update name in case it changed
             save_leaderboard()
             
-            # Create/update votes embed immediately after voting
+            # Create/update votes embed immediately after the match message
             embed = create_votes_embed(match_id)
             votes_msg_id = vote_data[match_id].get("votes_msg_id")
+            match_msg_id = vote_data[match_id]["match_msg_id"]
             
             if votes_msg_id:
                 try:
                     votes_message = await interaction.channel.fetch_message(votes_msg_id)
                     await votes_message.edit(embed=embed)
                 except discord.NotFound:
-                    # Message was deleted, create new one right after the match message
+                    # Message was deleted, create new one as reply to match message
                     try:
-                        match_message = await interaction.channel.fetch_message(vote_data[match_id]["match_msg_id"])
+                        match_message = await interaction.channel.fetch_message(match_msg_id)
                         votes_message = await match_message.reply(embed=embed, mention_author=False)
                         vote_data[match_id]["votes_msg_id"] = votes_message.id
-                    except:
-                        votes_message = await interaction.channel.send(embed=embed)
-                        vote_data[match_id]["votes_msg_id"] = votes_message.id
+                    except Exception as e:
+                        print(f"Error creating votes reply: {e}")
             else:
-                # Create first votes message right after the match message
+                # Create first votes message as reply to match message
                 try:
-                    match_message = await interaction.channel.fetch_message(vote_data[match_id]["match_msg_id"])
+                    match_message = await interaction.channel.fetch_message(match_msg_id)
                     votes_message = await match_message.reply(embed=embed, mention_author=False)
                     vote_data[match_id]["votes_msg_id"] = votes_message.id
-                except:
+                except Exception as e:
+                    print(f"Error creating votes reply: {e}")
+                    # Fallback: create at bottom if reply fails
                     votes_message = await interaction.channel.send(embed=embed)
                     vote_data[match_id]["votes_msg_id"] = votes_message.id
             
@@ -375,7 +377,7 @@ async def post_match(match):
         print(f"Error posting match: {e}")
         return
     
-    # Store match data
+    # Store match data first
     vote_data[match_id] = {
         "home": set(), 
         "draw": set(), 
@@ -388,6 +390,14 @@ async def post_match(match):
         "home_team": home_team,
         "away_team": away_team
     }
+    
+    # Create the votes embed immediately as a reply to the match
+    try:
+        votes_embed = create_votes_embed(match_id)
+        votes_message = await match_message.reply(embed=votes_embed, mention_author=False)
+        vote_data[match_id]["votes_msg_id"] = votes_message.id
+    except Exception as e:
+        print(f"Error creating initial votes embed: {e}")
     
     posted_matches.add(match_id)
     save_posted()
