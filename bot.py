@@ -1,6 +1,7 @@
 import os
 import json
 import aiohttp
+import asyncio
 from datetime import datetime, timezone, timedelta
 from io import BytesIO
 from PIL import Image
@@ -59,18 +60,13 @@ last_leaderboard_msg_id = None
 def create_votes_embed(match_id, match_result=None):
     votes_dict = vote_data[match_id]
     embed = discord.Embed(title="Current Votes", color=discord.Color.green())
+    if match_result:
+        embed.title += f" — Winner: {match_result.capitalize()}"
 
     for option in ["home", "draw", "away"]:
         voters = sorted(votes_dict[option])
-        value_text = "\n".join(voters) if voters else "No votes yet"
-        # Mark correct votes if match_result is given
-        if match_result == option:
-            value_text += " ✅ Correct"
-        embed.add_field(
-            name=option.capitalize(),
-            value=value_text,
-            inline=False
-        )
+        value = "\n".join(voters) if voters else "No votes yet"
+        embed.add_field(name=option.capitalize(), value=value, inline=False)
     return embed
 
 # ==== GENERATE MATCH IMAGE ====
@@ -206,9 +202,9 @@ async def post_match(match):
     view.add_item(VoteButton(label="Draw", category="draw", match_id=match_id))
     view.add_item(VoteButton(label="Away", category="away", match_id=match_id))
 
-    votes_msg = await channel.send(embed=embed, file=file, view=view)
+    await channel.send(embed=embed, file=file, view=view)
     vote_data[match_id] = {"home": set(), "draw": set(), "away": set(),
-                           "votes_msg_id": votes_msg.id, "locked_users": set()}
+                           "votes_msg_id": None, "locked_users": set()}
     posted_matches.add(match_id)
     save_posted()
 
@@ -235,22 +231,25 @@ async def update_match_results():
                     if not result:
                         continue
 
-                    # Update leaderboard points
+                    # Update leaderboard points for correct predictions
                     for uid, v in leaderboard.items():
                         if v.get("predictions", {}).get(match_id) == result:
                             v["points"] = v.get("points", 0) + 1
                             leaderboard_changed = True
                     save_leaderboard()
 
-                    # Update votes embed for finished match
+                    # Update vote message embed to mark correct votes and disable buttons
                     if match_id in vote_data:
                         try:
                             msg_id = vote_data[match_id]["votes_msg_id"]
                             if msg_id:
                                 channel = bot.get_channel(MATCH_CHANNEL_ID)
                                 votes_message = await channel.fetch_message(msg_id)
+
+                                # Update embed with correct votes
                                 embed = create_votes_embed(match_id, match_result=result)
 
+                                # Disable buttons
                                 new_view = View()
                                 for item in votes_message.components[0].children:
                                     item.disabled = True
@@ -322,8 +321,8 @@ async def leaderboard_command(interaction: discord.Interaction):
     embed = discord.Embed(title="🏆 Leaderboard", description=desc, color=discord.Color.gold())
     await interaction.response.send_message(embed=embed)
 
-# ==== TEST COMMAND ====
-@bot.tree.command(name="test_matches", description="Post 2 fake matches for testing.")
+# ==== TEST MATCHES COMMAND ====
+@bot.tree.command(name="test_matches", description="Post 2 fake matches for testing with points.")
 async def test_matches(interaction: discord.Interaction):
     now = datetime.now(timezone.utc)
     fake_matches = [
@@ -334,9 +333,44 @@ async def test_matches(interaction: discord.Interaction):
          "awayTeam": {"name": "Team D", "crest": None}, "utcDate": (now + timedelta(minutes=10)).isoformat(),
          "competition": {"name": "Test League"}}
     ]
+
     for match in fake_matches:
         await post_match(match)
-    await interaction.response.send_message("✅ Posted test matches!", ephemeral=True)
+
+    await interaction.response.send_message("✅ Posted test matches! Voting is open.", ephemeral=True)
+
+    # After a short delay, mark matches as finished and assign points
+    async def finish_match(match_id, winner):
+        await asyncio.sleep(60)  # 1-minute delay for testing
+        if match_id in vote_data:
+            # Update leaderboard points
+            for uid, v in leaderboard.items():
+                if v.get("predictions", {}).get(match_id) == winner:
+                    v["points"] = v.get("points", 0) + 1
+            save_leaderboard()
+
+            # Update votes embed and disable buttons
+            try:
+                msg_id = vote_data[match_id]["votes_msg_id"]
+                if msg_id:
+                    channel = bot.get_channel(MATCH_CHANNEL_ID)
+                    votes_message = await channel.fetch_message(msg_id)
+
+                    # Update embed with correct result
+                    embed = create_votes_embed(match_id, match_result=winner)
+
+                    # Disable buttons
+                    new_view = View()
+                    for item in votes_message.components[0].children:
+                        item.disabled = True
+                        new_view.add_item(item)
+
+                    await votes_message.edit(embed=embed, view=new_view)
+            except Exception as e:
+                print(f"Failed to finish test match {match_id}: {e}")
+
+    asyncio.create_task(finish_match("test1", "home"))
+    asyncio.create_task(finish_match("test2", "away"))
 
 # ==== STARTUP ====
 @bot.event
@@ -351,7 +385,7 @@ async def on_ready():
 async def auto_post_matches():
     matches = await fetch_matches()
     if not matches:
-        return  # Don't ping if no new matches
+        return
 
     league_dict = {}
     for m in matches:
