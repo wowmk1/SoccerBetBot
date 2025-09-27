@@ -2,8 +2,6 @@ import os
 import json
 import aiohttp
 from datetime import datetime, timezone, timedelta
-from io import BytesIO
-from PIL import Image
 import discord
 from discord.ext import commands, tasks
 
@@ -46,37 +44,8 @@ VOTE_EMOJIS = {
     "away": "AWAY_TEAM"
 }
 
-# ==== MATCH IMAGE ====
-async def generate_match_image(home_url, away_url):
-    async with aiohttp.ClientSession() as session:
-        home_img_bytes, away_img_bytes = None, None
-        try:
-            if home_url:
-                async with session.get(home_url) as r:
-                    home_img_bytes = await r.read()
-        except: pass
-        try:
-            if away_url:
-                async with session.get(away_url) as r:
-                    away_img_bytes = await r.read()
-        except: pass
-
-    size = (100, 100)
-    img = Image.new("RGBA", (size[0]*2 + 40, size[1]), (255, 255, 255, 0))
-    if home_img_bytes:
-        home = Image.open(BytesIO(home_img_bytes)).convert("RGBA").resize(size)
-        img.paste(home, (0, 0), home)
-    if away_img_bytes:
-        away = Image.open(BytesIO(away_img_bytes)).convert("RGBA").resize(size)
-        img.paste(away, (size[0]+40, 0), away)
-
-    buffer = BytesIO()
-    img.save(buffer, format="PNG")
-    buffer.seek(0)
-    return buffer
-
 # ==== FETCH MATCHES ====
-async def fetch_matches(days_ahead=1):
+async def fetch_matches(days_ahead=7):
     now = datetime.now(timezone.utc)
     future = now + timedelta(days=days_ahead)
     matches = []
@@ -115,15 +84,15 @@ async def post_match(match):
         color=discord.Color.blue()
     )
 
+    # Home crest as thumbnail, away crest as main image
     home_crest = match["homeTeam"].get("crest")
     away_crest = match["awayTeam"].get("crest")
-    file = None
-    if home_crest or away_crest:
-        image_buffer = await generate_match_image(home_crest, away_crest)
-        file = discord.File(fp=image_buffer, filename="match.png")
-        embed.set_image(url="attachment://match.png")
+    if home_crest:
+        embed.set_thumbnail(url=home_crest)
+    if away_crest:
+        embed.set_image(url=away_crest)
 
-    msg = await channel.send(embed=embed, file=file)
+    msg = await channel.send(embed=embed)
 
     # Store kickoff time
     if not hasattr(bot, "match_times"):
@@ -181,7 +150,7 @@ async def on_raw_reaction_add(payload):
     leaderboard[user_id]["predictions"][match_id] = VOTE_EMOJIS[emoji_name]
     save_leaderboard()
 
-    # Update embed with voter names without duplicating the image
+    # Update embed with voter names without duplicating images
     voter_names = [v["name"] for uid, v in leaderboard.items() if match_id in v.get("predictions", {})]
     embed = message.embeds[0]
     kickoff_line = embed.description.split("Kickoff:")[1].splitlines()[0]
@@ -190,12 +159,14 @@ async def on_raw_reaction_add(payload):
     if voter_names:
         new_desc += "\n\n**Voted:** " + ", ".join(voter_names)
 
-    # Create a new embed preserving image
+    # Create new embed preserving thumbnail and image URLs
     new_embed = discord.Embed(
         title=embed.title,
         description=new_desc,
         color=embed.color
     )
+    if embed.thumbnail.url:
+        new_embed.set_thumbnail(url=embed.thumbnail.url)
     if embed.image.url:
         new_embed.set_image(url=embed.image.url)
 
