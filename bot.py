@@ -146,9 +146,10 @@ class VoteButton(Button):
             }
 
         if user.id in vote_data[match_id]["locked_users"]:
-            await interaction.response.send_message("You have already voted!", ephemeral=True)
+            await interaction.response.send_message("✅ You have already voted!", ephemeral=True)
             return
 
+        # Record vote
         vote_data[match_id][self.category].add(user.name)
         vote_data[match_id]["locked_users"].add(user.id)
 
@@ -169,7 +170,9 @@ class VoteButton(Button):
         leaderboard[user_id]["predictions"][str(match_id)] = self.category
         save_leaderboard()
 
-        await interaction.response.defer()
+        # Update this button label to show user voted
+        self.label = f"{self.label} ✅"
+        await interaction.response.edit_message(view=self.view)
 
 # ==== POST MATCH ====
 async def post_match(match):
