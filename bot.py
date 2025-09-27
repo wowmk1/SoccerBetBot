@@ -1,7 +1,6 @@
 import os
 import json
 import aiohttp
-import asyncio
 from datetime import datetime, timezone, timedelta
 from io import BytesIO
 from PIL import Image
@@ -9,6 +8,7 @@ import discord
 from discord.ext import commands, tasks
 from discord.ui import View, Button
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+import asyncio
 
 # ==== ENV VARIABLES ====
 DISCORD_BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN")
@@ -55,6 +55,7 @@ COMPETITIONS = ["PL", "CL", "BL1", "PD", "FL1", "SA", "EC", "WC"]
 
 # ==== TRACK VOTES ====
 vote_data = {}  # match_id: {"home": set(), "draw": set(), "away": set(), "votes_msg_id": int, "locked_users": set(), "buttons_disabled": bool}
+
 last_leaderboard_msg_id = None
 
 # ==== VOTES EMBED CREATION ====
@@ -91,10 +92,10 @@ async def generate_match_image(home_url, away_url):
     img = Image.new("RGBA", (width, height), (255, 255, 255, 0))
     if home_img_bytes:
         home = Image.open(BytesIO(home_img_bytes)).convert("RGBA").resize(size)
-        img.paste(home, (0, 0), home)
+        img.paste(home, (0,0), home)
     if away_img_bytes:
         away = Image.open(BytesIO(away_img_bytes)).convert("RGBA").resize(size)
-        img.paste(away, (size[0]+padding, 0), away)
+        img.paste(away, (size[0]+padding,0), away)
     buffer = BytesIO()
     img.save(buffer, format="PNG")
     buffer.seek(0)
@@ -114,7 +115,10 @@ async def fetch_matches():
                     for m in data.get("matches", []):
                         m["competition"]["name"] = data.get("competition", {}).get("name", comp)
                         matches.append(m)
-    return [m for m in matches if now <= datetime.fromisoformat(m['utcDate'].replace("Z", "+00:00")) <= next_24h]
+    return [
+        m for m in matches
+        if now <= datetime.fromisoformat(m['utcDate'].replace("Z","+00:00")) <= next_24h
+    ]
 
 # ==== VOTE BUTTON ====
 class VoteButton(Button):
@@ -137,10 +141,9 @@ class VoteButton(Button):
         if user.id in vote_data[match_id]["locked_users"]:
             await interaction.response.send_message("✅ You have already voted!", ephemeral=True)
             return
-        # Record vote
         vote_data[match_id][self.category].add(user.name)
         vote_data[match_id]["locked_users"].add(user.id)
-        # Update votes embed
+
         votes_msg_id = vote_data[match_id]["votes_msg_id"]
         embed = create_votes_embed(match_id)
         if votes_msg_id:
@@ -149,10 +152,10 @@ class VoteButton(Button):
         else:
             votes_message = await interaction.channel.send(embed=embed)
             vote_data[match_id]["votes_msg_id"] = votes_message.id
-        # Update leaderboard predictions
+
         user_id = str(user.id)
         if user_id not in leaderboard:
-            leaderboard[user_id] = {"name": user.name, "points": 0, "predictions": {}}
+            leaderboard[user_id] = {"name": user.name, "points":0, "predictions":{}}
         leaderboard[user_id]["predictions"][match_id] = self.category
         save_leaderboard()
         await interaction.response.send_message(f"You voted for **{self.label}**!", ephemeral=True)
@@ -162,7 +165,7 @@ async def post_match(match):
     match_id = str(match["id"])
     if match_id in posted_matches:
         return
-    match_time = datetime.fromisoformat(match['utcDate'].replace("Z", "+00:00"))
+    match_time = datetime.fromisoformat(match['utcDate'].replace("Z","+00:00"))
     if match_time < datetime.now(timezone.utc):
         return
     kickoff_ts = int(match_time.timestamp())
@@ -181,12 +184,11 @@ async def post_match(match):
         image_buffer = await generate_match_image(home_crest, away_crest)
         file = discord.File(fp=image_buffer, filename="match.png")
         embed.set_image(url="attachment://match.png")
-    # Add vote buttons
     view = View()
-    view.add_item(VoteButton("Home", "home", match_id, kickoff_time=match_time))
-    view.add_item(VoteButton("Draw", "draw", match_id, kickoff_time=match_time))
-    view.add_item(VoteButton("Away", "away", match_id, kickoff_time=match_time))
-    votes_message = await channel.send(embed=embed, file=file, view=view)
+    view.add_item(VoteButton("Home","home",match_id,match_time))
+    view.add_item(VoteButton("Draw","draw",match_id,match_time))
+    view.add_item(VoteButton("Away","away",match_id,match_time))
+    votes_message = await channel.send(embed=embed,file=file,view=view)
     vote_data[match_id] = {"home": set(), "draw": set(), "away": set(),
                            "votes_msg_id": votes_message.id, "locked_users": set(), "buttons_disabled": False}
     posted_matches.add(match_id)
@@ -197,7 +199,7 @@ async def post_match(match):
 async def update_match_results():
     global last_leaderboard_msg_id
     leaderboard_changed = False
-    previous_points = {uid: v.get("points", 0) for uid, v in leaderboard.items()}
+    previous_points = {uid: v.get("points",0) for uid,v in leaderboard.items()}
     async with aiohttp.ClientSession() as session:
         for comp in COMPETITIONS:
             url = f"{BASE_URL}{comp}/matches"
@@ -210,43 +212,42 @@ async def update_match_results():
                     status = m.get("status")
                     if status != "FINISHED":
                         continue
-                    result = m.get("score", {}).get("winner")
+                    result = m.get("score",{}).get("winner")
                     if not result:
                         continue
-                    # Update leaderboard points
-                    for uid, v in leaderboard.items():
-                        if v.get("predictions", {}).get(match_id) == result:
-                            v["points"] = v.get("points", 0) + 1
+                    for uid,v in leaderboard.items():
+                        if v.get("predictions",{}).get(match_id) == result:
+                            v["points"] = v.get("points",0)+1
                             leaderboard_changed = True
                     save_leaderboard()
-                    # Update vote embed & disable buttons
                     if match_id in vote_data:
                         try:
                             msg_id = vote_data[match_id]["votes_msg_id"]
                             if msg_id:
                                 channel = bot.get_channel(MATCH_CHANNEL_ID)
                                 votes_message = await channel.fetch_message(msg_id)
-                                embed = create_votes_embed(match_id, match_result=result)
+                                embed = create_votes_embed(match_id,match_result=result)
                                 new_view = View()
-                                for item in votes_message.components[0].children:
+                                for item in votes_message.children if hasattr(votes_message,"children") else []:
                                     item.disabled = True
                                     new_view.add_item(item)
-                                await votes_message.edit(embed=embed, view=new_view)
+                                await votes_message.edit(embed=embed,view=new_view)
                                 vote_data[match_id]["buttons_disabled"] = True
                         except Exception as e:
                             print(f"Failed to update votes for finished match: {e}")
-    # Update leaderboard message
     if leaderboard_changed:
         channel = bot.get_channel(LEADERBOARD_CHANNEL_ID)
         if not channel:
             return
         users = [v for v in leaderboard.values() if v.get("predictions")]
-        sorted_lb = sorted(users, key=lambda x: (-x.get("points", 0), x["name"].lower()))
+        if not users:
+            return
+        sorted_lb = sorted(users, key=lambda x:(-x.get("points",0), x["name"].lower()))
         desc_lines = []
         for i, entry in enumerate(sorted_lb[:10]):
-            uid = next(uid for uid, v in leaderboard.items() if v["name"] == entry["name"])
-            diff = entry.get("points", 0) - previous_points.get(uid, 0)
-            suffix = f" (+{diff})" if diff > 0 else ""
+            uid = next(uid for uid,v in leaderboard.items() if v["name"]==entry["name"])
+            diff = entry.get("points",0) - previous_points.get(uid,0)
+            suffix = f" (+{diff})" if diff>0 else ""
             desc_lines.append(f"**{i+1}. {entry['name']}** — {entry.get('points',0)} pts{suffix}")
         desc = "\n".join(desc_lines)
         embed = discord.Embed(title="🏆 Leaderboard", description=desc, color=discord.Color.gold())
@@ -262,109 +263,46 @@ async def update_match_results():
             last_leaderboard_msg_id = msg.id
 
 # ==== COMMANDS ====
-@bot.tree.command(name="matches", description="Show upcoming matches in the next 24 hours.")
+@bot.tree.command(name="matches",description="Show upcoming matches in the next 24 hours.")
 async def matches_command(interaction: discord.Interaction):
     matches = await fetch_matches()
     if not matches:
-        await interaction.response.send_message("No upcoming matches in the next 24 hours.", ephemeral=True)
+        await interaction.response.send_message("No upcoming matches in the next 24 hours.",ephemeral=True)
         return
-    league_dict = {}
+    league_dict={}
     for m in matches:
-        league_name = m["competition"].get("name", "Unknown League")
-        league_dict.setdefault(league_name, []).append(m)
-    for league_name, league_matches in league_dict.items():
+        league_name = m["competition"].get("name","Unknown League")
+        league_dict.setdefault(league_name,[]).append(m)
+    for league_name,league_matches in league_dict.items():
         await interaction.channel.send(f"🏟 **{league_name}**")
         for m in league_matches:
             await post_match(m)
-    await interaction.response.send_message("✅ Posted upcoming matches for the next 24 hours!", ephemeral=True)
+    await interaction.response.send_message("✅ Posted upcoming matches for the next 24 hours!",ephemeral=True)
 
-@bot.tree.command(name="leaderboard", description="Show the leaderboard.")
+@bot.tree.command(name="leaderboard",description="Show the leaderboard.")
 async def leaderboard_command(interaction: discord.Interaction):
     users = [v for v in leaderboard.values() if v.get("predictions")]
     if not users:
-        await interaction.response.send_message("Leaderboard is empty.", ephemeral=True)
+        await interaction.response.send_message("Leaderboard is empty.",ephemeral=True)
         return
-    sorted_lb = sorted(users, key=lambda x: (-x.get("points", 0), x["name"].lower()))
-    desc = "\n".join([f"**{i+1}. {entry['name']}** — {entry.get('points', 0)} pts" for i, entry in enumerate(sorted_lb[:10])])
-    embed = discord.Embed(title="🏆 Leaderboard", description=desc, color=discord.Color.gold())
+    sorted_lb = sorted(users,key=lambda x:(-x.get("points",0),x["name"].lower()))
+    desc = "\n".join([f"**{i+1}. {entry['name']}** — {entry.get('points',0)} pts" for i,entry in enumerate(sorted_lb[:10])])
+    embed = discord.Embed(title="🏆 Leaderboard",description=desc,color=discord.Color.gold())
     await interaction.response.send_message(embed=embed)
 
-# ==== TEST MATCHES ====
-@bot.tree.command(name="test_matches", description="Post test matches and simulate votes.")
+# ==== TEST MATCHES COMMAND ====
+@bot.tree.command(name="test_matches",description="Start test matches and simulate votes.")
 async def test_matches_command(interaction: discord.Interaction):
-    await interaction.response.send_message("✅ Posting test matches...", ephemeral=True)
+    await interaction.response.send_message("🧪 Starting test matches...",ephemeral=True)
     now = datetime.now(timezone.utc)
     test_match = {
         "id": 999999,
-        "utcDate": (now + timedelta(minutes=2)).isoformat(),
-        "homeTeam": {"name": "Team A", "crest": None},
-        "awayTeam": {"name": "Team B", "crest": None},
-        "competition": {"name": "Test League"}
+        "utcDate": (now+timedelta(minutes=1)).isoformat(),
+        "homeTeam":{"name":"Team A","crest":None},
+        "awayTeam":{"name":"Team B","crest":None},
+        "competition":{"name":"Test League"}
     }
     await post_match(test_match)
-
-    async def simulate_votes_and_finish():
-        await asyncio.sleep(5)  # wait a bit for vote messages
-        for match_id, votes_dict in vote_data.items():
-            if votes_dict["buttons_disabled"]:
-                continue
-            votes_dict["home"].add("Tester1")
-            votes_dict["draw"].add("Tester2")
-            votes_dict["away"].add("Tester3")
-            votes_dict["locked_users"].update({111, 222, 333})
-            # Mark match finished as home wins
-            result = "home"
-            try:
-                msg_id = votes_dict["votes_msg_id"]
-                if msg_id:
-                    channel = bot.get_channel(MATCH_CHANNEL_ID)
-                    votes_message = await channel.fetch_message(msg_id)
-                    embed = create_votes_embed(match_id, match_result=result)
-                    new_view = View()
-                    for item in votes_message.components[0].children:
-                        item.disabled = True
-                        new_view.add_item(item)
-                    await votes_message.edit(embed=embed, view=new_view)
-                    votes_dict["buttons_disabled"] = True
-            except Exception as e:
-                print(f"Failed to update votes for test match: {e}")
-
-        # Update leaderboard in LEADERBOARD_CHANNEL_ID
-        global last_leaderboard_msg_id
-        leaderboard_changed = True
-        previous_points = {uid: v.get("points", 0) for uid, v in leaderboard.items()}
-        for match_id in vote_data:
-            for uid, v in leaderboard.items():
-                if v.get("predictions", {}).get(match_id) == "home":
-                    v["points"] = v.get("points", 0) + 1
-        save_leaderboard()
-
-        if leaderboard_changed:
-            channel = bot.get_channel(LEADERBOARD_CHANNEL_ID)
-            if not channel:
-                return
-            users = [v for v in leaderboard.values() if v.get("predictions")]
-            sorted_lb = sorted(users, key=lambda x: (-x.get("points", 0), x["name"].lower()))
-            desc_lines = []
-            for i, entry in enumerate(sorted_lb[:10]):
-                uid = next(uid for uid, v in leaderboard.items() if v["name"] == entry["name"])
-                diff = entry.get("points", 0) - previous_points.get(uid, 0)
-                suffix = f" (+{diff})" if diff > 0 else ""
-                desc_lines.append(f"**{i+1}. {entry['name']}** — {entry.get('points',0)} pts{suffix}")
-            desc = "\n".join(desc_lines)
-            embed = discord.Embed(title="🏆 Leaderboard (Test)", description=desc, color=discord.Color.gold())
-            try:
-                if last_leaderboard_msg_id:
-                    msg = await channel.fetch_message(last_leaderboard_msg_id)
-                    await msg.edit(embed=embed)
-                else:
-                    msg = await channel.send(embed=embed)
-                    last_leaderboard_msg_id = msg.id
-            except:
-                msg = await channel.send(embed=embed)
-                last_leaderboard_msg_id = msg.id
-
-    bot.loop.create_task(simulate_votes_and_finish())
 
 # ==== STARTUP ====
 @bot.event
@@ -380,6 +318,6 @@ async def daily_fetch_matches():
     matches = await fetch_matches()
     for m in matches:
         await post_match(m)
-scheduler.add_job(lambda: bot.loop.create_task(daily_fetch_matches()), "cron", hour=6, minute=0)  # 6 AM UTC
+scheduler.add_job(lambda: asyncio.create_task(daily_fetch_matches()),"cron",hour=6,minute=0)
 
 bot.run(DISCORD_BOT_TOKEN)
