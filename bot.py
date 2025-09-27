@@ -7,7 +7,6 @@ from PIL import Image
 import discord
 from discord.ext import commands, tasks
 from discord.ui import View, Button
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # ==== ENV VARIABLES ====
 DISCORD_BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN")
@@ -53,8 +52,7 @@ HEADERS = {"X-Auth-Token": FOOTBALL_DATA_API_KEY}
 COMPETITIONS = ["PL", "CL", "BL1", "PD", "FL1", "SA", "EC", "WC"]
 
 # ==== TRACK VOTES ====
-vote_data = {}  # match_id: {"home": set(), "draw": set(), "away": set(), "votes_msg_id": int, "locked_users": set(), "buttons_disabled": bool}
-
+vote_data = {}  # match_id: {"home": set(), "draw": set(), "away": set(), "votes_msg_id": int, "locked_users": set()}
 last_leaderboard_msg_id = None
 
 # ==== VOTES EMBED CREATION ====
@@ -64,10 +62,15 @@ def create_votes_embed(match_id, match_result=None):
 
     for option in ["home", "draw", "away"]:
         voters = sorted(votes_dict[option])
-        field_value = "\n".join(voters) if voters else "No votes yet"
+        value_text = "\n".join(voters) if voters else "No votes yet"
+        # Mark correct votes if match_result is given
         if match_result == option:
-            field_value += "\n✅ Correct!"
-        embed.add_field(name=option.capitalize(), value=field_value, inline=False)
+            value_text += " ✅ Correct"
+        embed.add_field(
+            name=option.capitalize(),
+            value=value_text,
+            inline=False
+        )
     return embed
 
 # ==== GENERATE MATCH IMAGE ====
@@ -95,9 +98,10 @@ async def generate_match_image(home_url, away_url):
     if home_img_bytes:
         home = Image.open(BytesIO(home_img_bytes)).convert("RGBA").resize(size)
         img.paste(home, (0, 0), home)
+
     if away_img_bytes:
         away = Image.open(BytesIO(away_img_bytes)).convert("RGBA").resize(size)
-        img.paste(away, (size[0]+padding, 0), away)
+        img.paste(away, (size[0] + padding, 0), away)
 
     buffer = BytesIO()
     img.save(buffer, format="PNG")
@@ -127,24 +131,18 @@ async def fetch_matches():
 
 # ==== VOTE BUTTON ====
 class VoteButton(Button):
-    def __init__(self, label, category, match_id, kickoff_time):
+    def __init__(self, label, category, match_id):
         super().__init__(label=label, style=discord.ButtonStyle.primary)
         self.category = category
         self.match_id = match_id
-        self.kickoff_time = kickoff_time
 
     async def callback(self, interaction: discord.Interaction):
-        now = datetime.now(timezone.utc)
-        if now >= self.kickoff_time:
-            await interaction.response.send_message("⏰ Voting for this match has ended!", ephemeral=True)
-            return
-
         user = interaction.user
         match_id = self.match_id
 
         if match_id not in vote_data:
             vote_data[match_id] = {"home": set(), "draw": set(), "away": set(),
-                                   "votes_msg_id": None, "locked_users": set(), "buttons_disabled": False}
+                                   "votes_msg_id": None, "locked_users": set()}
 
         if user.id in vote_data[match_id]["locked_users"]:
             await interaction.response.send_message("✅ You have already voted!", ephemeral=True)
@@ -164,7 +162,7 @@ class VoteButton(Button):
             votes_message = await interaction.channel.send(embed=embed)
             vote_data[match_id]["votes_msg_id"] = votes_message.id
 
-        # Update leaderboard predictions
+        # Update leaderboard
         user_id = str(user.id)
         if user_id not in leaderboard:
             leaderboard[user_id] = {"name": user.name, "points": 0, "predictions": {}}
@@ -204,13 +202,13 @@ async def post_match(match):
 
     # Add vote buttons
     view = View()
-    view.add_item(VoteButton("Home", "home", match_id, kickoff_time=match_time))
-    view.add_item(VoteButton("Draw", "draw", match_id, kickoff_time=match_time))
-    view.add_item(VoteButton("Away", "away", match_id, kickoff_time=match_time))
+    view.add_item(VoteButton(label="Home", category="home", match_id=match_id))
+    view.add_item(VoteButton(label="Draw", category="draw", match_id=match_id))
+    view.add_item(VoteButton(label="Away", category="away", match_id=match_id))
 
-    votes_message = await channel.send(embed=embed, file=file, view=view)
+    votes_msg = await channel.send(embed=embed, file=file, view=view)
     vote_data[match_id] = {"home": set(), "draw": set(), "away": set(),
-                           "votes_msg_id": votes_message.id, "locked_users": set(), "buttons_disabled": False}
+                           "votes_msg_id": votes_msg.id, "locked_users": set()}
     posted_matches.add(match_id)
     save_posted()
 
@@ -244,7 +242,7 @@ async def update_match_results():
                             leaderboard_changed = True
                     save_leaderboard()
 
-                    # Update vote embed & disable buttons
+                    # Update votes embed for finished match
                     if match_id in vote_data:
                         try:
                             msg_id = vote_data[match_id]["votes_msg_id"]
@@ -257,8 +255,8 @@ async def update_match_results():
                                 for item in votes_message.components[0].children:
                                     item.disabled = True
                                     new_view.add_item(item)
+
                                 await votes_message.edit(embed=embed, view=new_view)
-                                vote_data[match_id]["buttons_disabled"] = True
                         except Exception as e:
                             print(f"Failed to update votes for finished match: {e}")
 
@@ -324,16 +322,49 @@ async def leaderboard_command(interaction: discord.Interaction):
     embed = discord.Embed(title="🏆 Leaderboard", description=desc, color=discord.Color.gold())
     await interaction.response.send_message(embed=embed)
 
+# ==== TEST COMMAND ====
+@bot.tree.command(name="test_matches", description="Post 2 fake matches for testing.")
+async def test_matches(interaction: discord.Interaction):
+    now = datetime.now(timezone.utc)
+    fake_matches = [
+        {"id": "test1", "homeTeam": {"name": "Team A", "crest": None},
+         "awayTeam": {"name": "Team B", "crest": None}, "utcDate": (now + timedelta(minutes=5)).isoformat(),
+         "competition": {"name": "Test League"}},
+        {"id": "test2", "homeTeam": {"name": "Team C", "crest": None},
+         "awayTeam": {"name": "Team D", "crest": None}, "utcDate": (now + timedelta(minutes=10)).isoformat(),
+         "competition": {"name": "Test League"}}
+    ]
+    for match in fake_matches:
+        await post_match(match)
+    await interaction.response.send_message("✅ Posted test matches!", ephemeral=True)
+
 # ==== STARTUP ====
 @bot.event
 async def on_ready():
     await bot.tree.sync()
+    auto_post_matches.start()
     update_match_results.start()
-    scheduler.start()
     print(f"Logged in as {bot.user}")
 
-# ==== DAILY MATCH POST SCHEDULER ====
-scheduler = AsyncIOScheduler()
-scheduler.add_job(lambda: bot.loop.create_task(daily_fetch_matches()), "cron", hour=6, minute=0)  # 6 AM UTC
+# ==== AUTO POST MATCHES ====
+@tasks.loop(minutes=30)
+async def auto_post_matches():
+    matches = await fetch_matches()
+    if not matches:
+        return  # Don't ping if no new matches
+
+    league_dict = {}
+    for m in matches:
+        league_name = m["competition"].get("name", "Unknown League")
+        league_dict.setdefault(league_name, []).append(m)
+
+    channel = bot.get_channel(MATCH_CHANNEL_ID)
+    if not channel:
+        return
+
+    for league_name, league_matches in league_dict.items():
+        await channel.send(f"🏟 **{league_name}**")
+        for m in league_matches:
+            await post_match(m)
 
 bot.run(DISCORD_BOT_TOKEN)
