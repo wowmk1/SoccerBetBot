@@ -109,6 +109,9 @@ async def post_match(match):
     if match_time < datetime.now(timezone.utc):
         return
 
+    # Format kickoff as Discord timestamp
+    kickoff_ts = int(match_time.timestamp())
+
     channel = bot.get_channel(MATCH_CHANNEL_ID)
     if not channel:
         return
@@ -116,7 +119,7 @@ async def post_match(match):
     match_id = str(match["id"])
     voter_names = [v["name"] for uid, v in leaderboard.items() if match_id in v.get("predictions", {})]
 
-    embed_desc = f"Kickoff: {match['utcDate']}"
+    embed_desc = f"Kickoff: <t:{kickoff_ts}:f>"
     if voter_names:
         embed_desc += "\n\n**Voted:** " + ", ".join(voter_names)
 
@@ -193,7 +196,7 @@ async def on_raw_reaction_add(payload):
     # Update embed description only (image stays)
     voter_names = [v["name"] for uid, v in leaderboard.items() if match_id in v.get("predictions", {})]
     embed = message.embeds[0]
-    kickoff_line = embed.description.split("Kickoff:")[1].splitlines()[0]
+    kickoff_line = embed.description.split("Kickoff:")[1].splitlines()[0].strip()
 
     new_desc = f"Kickoff: {kickoff_line}"
     if voter_names:
@@ -234,7 +237,7 @@ async def update_match_results():
                     save_leaderboard()
 
 # ==== COMMANDS ====
-@bot.tree.command(name="matches", description="Show upcoming matches.")
+@bot.tree.command(name="matches", description="Show upcoming matches in the next 24 hours.")
 async def matches_command(interaction: discord.Interaction):
     matches = await fetch_matches()
     if not matches:
