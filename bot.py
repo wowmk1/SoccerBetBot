@@ -56,17 +56,28 @@ vote_data = {}  # match_id: {"home": set(), "draw": set(), "away": set(), "votes
 last_leaderboard_msg_id = None
 
 # ==== VOTES EMBED CREATION ====
-def create_votes_embed(match_id):
+def create_votes_embed(match_id, match_result=None):
     votes_dict = vote_data[match_id]
     embed = discord.Embed(title="Current Votes", color=discord.Color.green())
 
     for option in ["home", "draw", "away"]:
         voters = sorted(votes_dict[option])
+        vote_count = len(voters)
+        if not voters:
+            value = "No votes yet"
+        else:
+            if match_result and match_result == option:
+                value = "\n".join([f"✅ {v}" for v in voters])
+            else:
+                value = "\n".join(voters)
         embed.add_field(
-            name=option.capitalize(),
-            value="\n".join(voters) if voters else "No votes yet",
+            name=f"{option.capitalize()} — {vote_count} vote{'s' if vote_count != 1 else ''}",
+            value=value,
             inline=False
         )
+
+    if match_result:
+        embed.set_footer(text=f"Match finished: {match_result.capitalize()} — Voting closed")
     return embed
 
 # ==== GENERATE MATCH IMAGE ====
@@ -144,13 +155,20 @@ class VoteButton(Button):
             await interaction.response.send_message("✅ You have already voted!", ephemeral=True)
             return
 
-        # Record vote
-        vote_data[match_id][self.category].add(user.name)
+        # Record vote as mention
+        vote_data[match_id][self.category].add(user.mention)
         vote_data[match_id]["locked_users"].add(user.id)
 
-        # Update votes embed
+        # Check if match has finished
+        match_result = None
+        for uid, v in leaderboard.items():
+            if "correct_matches" in v and match_id in v["correct_matches"]:
+                match_result = v["predictions"][match_id]
+                break
+
+        embed = create_votes_embed(match_id, match_result=match_result)
+
         votes_msg_id = vote_data[match_id]["votes_msg_id"]
-        embed = create_votes_embed(match_id)
         if votes_msg_id:
             votes_message = await interaction.channel.fetch_message(votes_msg_id)
             await votes_message.edit(embed=embed)
@@ -158,7 +176,7 @@ class VoteButton(Button):
             votes_message = await interaction.channel.send(embed=embed)
             vote_data[match_id]["votes_msg_id"] = votes_message.id
 
-        # Update leaderboard
+        # Update leaderboard predictions
         user_id = str(user.id)
         if user_id not in leaderboard:
             leaderboard[user_id] = {"name": user.name, "points": 0, "predictions": {}}
@@ -202,9 +220,9 @@ async def post_match(match):
     view.add_item(VoteButton(label="Draw", category="draw", match_id=match_id))
     view.add_item(VoteButton(label="Away", category="away", match_id=match_id))
 
-    await channel.send(embed=embed, file=file, view=view)
+    votes_msg = await channel.send(embed=embed, file=file, view=view)
     vote_data[match_id] = {"home": set(), "draw": set(), "away": set(),
-                           "votes_msg_id": None, "locked_users": set()}
+                           "votes_msg_id": votes_msg.id, "locked_users": set()}
     posted_matches.add(match_id)
     save_posted()
 
@@ -231,12 +249,40 @@ async def update_match_results():
                     if not result:
                         continue
 
+                    # Update points
                     for uid, v in leaderboard.items():
-                        if v.get("predictions", {}).get(match_id) == result:
+                        user_preds = v.get("predictions", {})
+                        if match_id in user_preds and user_preds[match_id] == result:
                             v["points"] = v.get("points",0)+1
+                            if "correct_matches" not in v:
+                                v["correct_matches"] = []
+                            if match_id not in v["correct_matches"]:
+                                v["correct_matches"].append(match_id)
                             leaderboard_changed = True
                     save_leaderboard()
 
+                    # Update vote embed and disable buttons
+                    if match_id in vote_data:
+                        votes_msg_id = vote_data[match_id].get("votes_msg_id")
+                        if votes_msg_id:
+                            try:
+                                channel = bot.get_channel(MATCH_CHANNEL_ID)
+                                votes_message = await channel.fetch_message(votes_msg_id)
+                                embed = create_votes_embed(match_id, match_result=result)
+                                # Disable buttons
+                                if votes_message.components:
+                                    new_view = View()
+                                    for row in votes_message.components:
+                                        for item in row.children:
+                                            item.disabled = True
+                                            new_view.add_item(item)
+                                    await votes_message.edit(embed=embed, view=new_view)
+                                else:
+                                    await votes_message.edit(embed=embed)
+                            except Exception as e:
+                                print(f"Failed to disable buttons: {e}")
+
+    # Update leaderboard message
     if leaderboard_changed:
         channel = bot.get_channel(LEADERBOARD_CHANNEL_ID)
         if not channel:
