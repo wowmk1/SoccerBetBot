@@ -140,7 +140,7 @@ async def generate_match_image(home_url, away_url):
 async def fetch_matches():
     now = datetime.now(timezone.utc)
     next_24h = now + timedelta(hours=24)
-    matches = []
+    matches_by_competition = {}
     
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
         for comp in COMPETITIONS:
@@ -149,25 +149,27 @@ async def fetch_matches():
                 async with session.get(url, headers=HEADERS) as resp:
                     if resp.status == 200:
                         data = await resp.json()
+                        competition_name = data.get("competition", {}).get("name", comp)
+                        comp_matches = []
+                        
                         for m in data.get("matches", []):
-                            m["competition"]["name"] = data.get("competition", {}).get("name", comp)
-                            matches.append(m)
+                            try:
+                                match_time = datetime.fromisoformat(m['utcDate'].replace("Z", "+00:00"))
+                                if now <= match_time <= next_24h:
+                                    m["competition"]["name"] = competition_name
+                                    comp_matches.append(m)
+                            except:
+                                continue
+                                
+                        if comp_matches:
+                            matches_by_competition[competition_name] = comp_matches
+                            
             except Exception as e:
                 print(f"Error fetching {comp} matches: {e}")
                 
-    # Only include matches in next 24h
-    filtered = []
-    for m in matches:
-        try:
-            match_time = datetime.fromisoformat(m['utcDate'].replace("Z", "+00:00"))
-            if now <= match_time <= next_24h:
-                filtered.append(m)
-        except:
-            continue
-            
-    # Fallback: if empty, add dummy test match
-    if not filtered:
-        filtered = [
+    # If no matches found, add fallback
+    if not matches_by_competition:
+        matches_by_competition["Fallback League"] = [
             {
                 "id": 88801,
                 "utcDate": (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat(),
@@ -176,7 +178,8 @@ async def fetch_matches():
                 "competition": {"name": "Fallback League"}
             }
         ]
-    return filtered
+    
+    return matches_by_competition
 
 # ==== PERSISTENT VIEW CLASS ====
 class PersistentMatchView(View):
@@ -256,7 +259,7 @@ class PersistentMatchView(View):
             leaderboard[user_id_str]["name"] = user.display_name  # Update name in case it changed
             save_leaderboard()
             
-            # Create/update votes embed
+            # Create/update votes embed immediately after voting
             embed = create_votes_embed(match_id)
             votes_msg_id = vote_data[match_id].get("votes_msg_id")
             
@@ -265,13 +268,23 @@ class PersistentMatchView(View):
                     votes_message = await interaction.channel.fetch_message(votes_msg_id)
                     await votes_message.edit(embed=embed)
                 except discord.NotFound:
-                    # Message was deleted, create new one
+                    # Message was deleted, create new one right after the match message
+                    try:
+                        match_message = await interaction.channel.fetch_message(vote_data[match_id]["match_msg_id"])
+                        votes_message = await match_message.reply(embed=embed, mention_author=False)
+                        vote_data[match_id]["votes_msg_id"] = votes_message.id
+                    except:
+                        votes_message = await interaction.channel.send(embed=embed)
+                        vote_data[match_id]["votes_msg_id"] = votes_message.id
+            else:
+                # Create first votes message right after the match message
+                try:
+                    match_message = await interaction.channel.fetch_message(vote_data[match_id]["match_msg_id"])
+                    votes_message = await match_message.reply(embed=embed, mention_author=False)
+                    vote_data[match_id]["votes_msg_id"] = votes_message.id
+                except:
                     votes_message = await interaction.channel.send(embed=embed)
                     vote_data[match_id]["votes_msg_id"] = votes_message.id
-            else:
-                # Create first votes message
-                votes_message = await interaction.channel.send(embed=embed)
-                vote_data[match_id]["votes_msg_id"] = votes_message.id
             
             # Enhanced success message
             home_team = vote_data[match_id]['home_team']
@@ -550,20 +563,41 @@ async def update_match_results():
 async def matches_command(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     try:
-        matches = await fetch_matches()
-        if not matches:
+        matches_by_competition = await fetch_matches()
+        if not matches_by_competition:
             await interaction.followup.send("No upcoming matches found.", ephemeral=True)
             return
+        
+        channel = bot.get_channel(MATCH_CHANNEL_ID)
+        if not channel:
+            await interaction.followup.send("❌ Match channel not found!", ephemeral=True)
+            return
             
-        posted_count = 0
-        for m in matches:
-            try:
-                await post_match(m)
-                posted_count += 1
-            except Exception as e:
-                print(f"Error posting match: {e}")
+        total_posted = 0
+        
+        # Post matches organized by competition
+        for competition_name, matches in matches_by_competition.items():
+            if not matches:
+                continue
                 
-        await interaction.followup.send(f"✅ Posted {posted_count} matches!", ephemeral=True)
+            # Post competition header
+            header_embed = discord.Embed(
+                title=f"🏆 {competition_name}",
+                description=f"📅 {len(matches)} match{'es' if len(matches) != 1 else ''} upcoming",
+                color=discord.Color.gold()
+            )
+            await channel.send(embed=header_embed)
+            
+            # Post each match in this competition
+            for match in matches:
+                try:
+                    await post_match(match)
+                    total_posted += 1
+                except Exception as e:
+                    print(f"Error posting match: {e}")
+                    
+        await interaction.followup.send(f"✅ Posted {total_posted} matches across {len(matches_by_competition)} competitions!", ephemeral=True)
+        
     except Exception as e:
         await interaction.followup.send(f"❌ Error fetching matches: {str(e)}", ephemeral=True)
 
@@ -717,10 +751,33 @@ scheduler = AsyncIOScheduler()
 
 async def daily_fetch_matches():
     try:
-        matches = await fetch_matches()
-        for match in matches:
-            await post_match(match)
-        print(f"Daily fetch completed - processed {len(matches)} matches")
+        matches_by_competition = await fetch_matches()
+        channel = bot.get_channel(MATCH_CHANNEL_ID)
+        if not channel:
+            print("Match channel not found for daily fetch")
+            return
+            
+        total_posted = 0
+        
+        # Post matches organized by competition
+        for competition_name, matches in matches_by_competition.items():
+            if not matches:
+                continue
+                
+            # Post competition header
+            header_embed = discord.Embed(
+                title=f"🏆 {competition_name}",
+                description=f"📅 {len(matches)} match{'es' if len(matches) != 1 else ''} today",
+                color=discord.Color.gold()
+            )
+            await channel.send(embed=header_embed)
+            
+            # Post each match in this competition
+            for match in matches:
+                await post_match(match)
+                total_posted += 1
+                
+        print(f"Daily fetch completed - posted {total_posted} matches across {len(matches_by_competition)} competitions")
     except Exception as e:
         print(f"Error in daily fetch: {e}")
 
