@@ -60,7 +60,6 @@ last_leaderboard_msg_id = None
 def create_votes_embed(match_id, match_result=None):
     votes_dict = vote_data[match_id]
     embed = discord.Embed(title="Current Votes", color=discord.Color.green())
-
     for option in ["home", "draw", "away"]:
         voters = sorted(votes_dict[option])
         field_value = "\n".join(voters) if voters else "No votes yet"
@@ -133,7 +132,7 @@ class VoteButton(Button):
         self.kickoff_time = kickoff_time
 
     async def callback(self, interaction: discord.Interaction):
-        # Defer immediately to avoid interaction failed
+        # defer to prevent "This interaction failed"
         await interaction.response.defer(ephemeral=True)
 
         now = datetime.now(timezone.utc)
@@ -166,7 +165,7 @@ class VoteButton(Button):
             votes_message = await interaction.channel.send(embed=embed)
             vote_data[match_id]["votes_msg_id"] = votes_message.id
 
-        # Update leaderboard predictions
+        # Update leaderboard
         user_id = str(user.id)
         if user_id not in leaderboard:
             leaderboard[user_id] = {"name": user.name, "points": 0, "predictions": {}}
@@ -298,10 +297,9 @@ async def update_match_results():
 # ==== COMMANDS ====
 @bot.tree.command(name="matches", description="Show upcoming matches in the next 24 hours.")
 async def matches_command(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
     matches = await fetch_matches()
     if not matches:
-        await interaction.followup.send("No upcoming matches in the next 24 hours.", ephemeral=True)
+        await interaction.response.send_message("No upcoming matches in the next 24 hours.", ephemeral=True)
         return
 
     league_dict = {}
@@ -314,24 +312,23 @@ async def matches_command(interaction: discord.Interaction):
         for m in league_matches:
             await post_match(m)
 
-    await interaction.followup.send("✅ Posted upcoming matches for the next 24 hours!", ephemeral=True)
+    await interaction.response.send_message("✅ Posted upcoming matches for the next 24 hours!", ephemeral=True)
 
 @bot.tree.command(name="leaderboard", description="Show the leaderboard.")
 async def leaderboard_command(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
     users = [v for v in leaderboard.values() if v.get("predictions")]
     if not users:
-        await interaction.followup.send("Leaderboard is empty.", ephemeral=True)
+        await interaction.response.send_message("Leaderboard is empty.", ephemeral=True)
         return
     sorted_lb = sorted(users, key=lambda x: (-x.get("points", 0), x["name"].lower()))
     desc = "\n".join([f"**{i+1}. {entry['name']}** — {entry.get('points', 0)} pts" for i, entry in enumerate(sorted_lb[:10])])
     embed = discord.Embed(title="🏆 Leaderboard", description=desc, color=discord.Color.gold())
-    await interaction.followup.send(embed=embed)
+    await interaction.response.send_message(embed=embed)
 
 # ==== TEST MATCHES COMMAND ====
 @bot.tree.command(name="test_matches", description="Post test matches for voting and leaderboard testing.")
 async def test_matches_command(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
+    await interaction.response.send_message("Posting test matches...", ephemeral=True)
 
     test_matches = [
         {
@@ -353,23 +350,20 @@ async def test_matches_command(interaction: discord.Interaction):
     for match in test_matches:
         await post_match(match)
 
-    await interaction.followup.send("✅ Test matches posted!", ephemeral=True)
-
 # ==== STARTUP ====
-scheduler = AsyncIOScheduler()
-
-async def daily_fetch_matches():
-    matches = await fetch_matches()
-    for match in matches:
-        await post_match(match)
-
-scheduler.add_job(lambda: bot.loop.create_task(daily_fetch_matches()), "cron", hour=6, minute=0)  # 6 AM UTC
-
 @bot.event
 async def on_ready():
     await bot.tree.sync()
     update_match_results.start()
     scheduler.start()
     print(f"Logged in as {bot.user}")
+
+# ==== DAILY MATCH POST SCHEDULER ====
+scheduler = AsyncIOScheduler()
+async def daily_fetch_matches():
+    matches = await fetch_matches()
+    for match in matches:
+        await post_match(match)
+scheduler.add_job(lambda: bot.loop.create_task(daily_fetch_matches()), "cron", hour=6, minute=0)  # 6 AM UTC
 
 bot.run(DISCORD_BOT_TOKEN)
