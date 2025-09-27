@@ -2,6 +2,8 @@ import os
 import json
 import aiohttp
 from datetime import datetime, timezone, timedelta
+from io import BytesIO
+from PIL import Image
 import discord
 from discord.ext import commands, tasks
 
@@ -44,22 +46,62 @@ VOTE_EMOJIS = {
     "away": "AWAY_TEAM"
 }
 
-# ==== FETCH MATCHES ====
-async def fetch_matches(days_ahead=7):
+# ==== GENERATE COMBINED MATCH IMAGE ====
+async def generate_match_image(home_url, away_url):
+    async with aiohttp.ClientSession() as session:
+        home_img_bytes, away_img_bytes = None, None
+        try:
+            if home_url:
+                async with session.get(home_url) as r:
+                    home_img_bytes = await r.read()
+        except: pass
+        try:
+            if away_url:
+                async with session.get(away_url) as r:
+                    away_img_bytes = await r.read()
+        except: pass
+
+    size = (100, 100)
+    padding = 40
+    width = size[0]*2 + padding
+    height = size[1]
+
+    img = Image.new("RGBA", (width, height), (255, 255, 255, 0))
+
+    if home_img_bytes:
+        home = Image.open(BytesIO(home_img_bytes)).convert("RGBA").resize(size)
+        img.paste(home, (0, 0), home)
+
+    if away_img_bytes:
+        away = Image.open(BytesIO(away_img_bytes)).convert("RGBA").resize(size)
+        img.paste(away, (size[0] + padding, 0), away)
+
+    buffer = BytesIO()
+    img.save(buffer, format="PNG")
+    buffer.seek(0)
+    return buffer
+
+# ==== FETCH MATCHES (NEXT 24H ONLY) ====
+async def fetch_matches():
     now = datetime.now(timezone.utc)
-    future = now + timedelta(days=days_ahead)
+    next_24h = now + timedelta(hours=24)
     matches = []
 
     async with aiohttp.ClientSession() as session:
         for comp in COMPETITIONS:
-            url = f"{BASE_URL}{comp}/matches?dateFrom={now.date()}&dateTo={future.date()}"
+            url = f"{BASE_URL}{comp}/matches?dateFrom={now.date()}&dateTo={next_24h.date()}"
             async with session.get(url, headers=HEADERS) as resp:
                 if resp.status == 200:
                     data = await resp.json()
                     for m in data.get("matches", []):
                         m["competition"]["name"] = data.get("competition", {}).get("name", comp)
                         matches.append(m)
-    return [m for m in matches if datetime.fromisoformat(m['utcDate'].replace("Z", "+00:00")) > datetime.now(timezone.utc)]
+
+    # Filter strictly for matches within the next 24h
+    return [
+        m for m in matches
+        if now <= datetime.fromisoformat(m['utcDate'].replace("Z", "+00:00")) <= next_24h
+    ]
 
 # ==== POST MATCH ====
 async def post_match(match):
@@ -84,15 +126,16 @@ async def post_match(match):
         color=discord.Color.blue()
     )
 
-    # Home crest as thumbnail, away crest as main image
+    # Generate combined image
     home_crest = match["homeTeam"].get("crest")
     away_crest = match["awayTeam"].get("crest")
-    if home_crest:
-        embed.set_thumbnail(url=home_crest)
-    if away_crest:
-        embed.set_image(url=away_crest)
+    file = None
+    if home_crest or away_crest:
+        image_buffer = await generate_match_image(home_crest, away_crest)
+        file = discord.File(fp=image_buffer, filename="match.png")
+        embed.set_image(url="attachment://match.png")
 
-    msg = await channel.send(embed=embed)
+    msg = await channel.send(embed=embed, file=file)
 
     # Store kickoff time
     if not hasattr(bot, "match_times"):
@@ -119,10 +162,8 @@ async def on_raw_reaction_add(payload):
     message = await channel.fetch_message(payload.message_id)
     match_id = str(message.id)
 
-    # Check custom emoji
     emoji_name = payload.emoji.name
     if emoji_name not in VOTE_EMOJIS:
-        # remove invalid reactions
         async for react in message.reactions:
             if getattr(react.emoji, "name", None) == emoji_name:
                 async for u in react.users():
@@ -130,7 +171,6 @@ async def on_raw_reaction_add(payload):
                         await react.remove(u)
         return
 
-    # Check match time
     match_time = bot.match_times.get(match_id)
     if not match_time or match_time < datetime.now(timezone.utc):
         return
@@ -150,7 +190,7 @@ async def on_raw_reaction_add(payload):
     leaderboard[user_id]["predictions"][match_id] = VOTE_EMOJIS[emoji_name]
     save_leaderboard()
 
-    # Update embed with voter names without duplicating images
+    # Update embed description only (image stays)
     voter_names = [v["name"] for uid, v in leaderboard.items() if match_id in v.get("predictions", {})]
     embed = message.embeds[0]
     kickoff_line = embed.description.split("Kickoff:")[1].splitlines()[0]
@@ -159,14 +199,12 @@ async def on_raw_reaction_add(payload):
     if voter_names:
         new_desc += "\n\n**Voted:** " + ", ".join(voter_names)
 
-    # Create new embed preserving thumbnail and image URLs
     new_embed = discord.Embed(
         title=embed.title,
         description=new_desc,
         color=embed.color
     )
-    if embed.thumbnail.url:
-        new_embed.set_thumbnail(url=embed.thumbnail.url)
+
     if embed.image.url:
         new_embed.set_image(url=embed.image.url)
 
@@ -198,14 +236,13 @@ async def update_match_results():
 # ==== COMMANDS ====
 @bot.tree.command(name="matches", description="Show upcoming matches.")
 async def matches_command(interaction: discord.Interaction):
-    matches = await fetch_matches(days_ahead=7)
+    matches = await fetch_matches()
     if not matches:
-        await interaction.response.send_message("No upcoming matches.", ephemeral=True)
+        await interaction.response.send_message("No upcoming matches in the next 24 hours.", ephemeral=True)
         return
 
-    # Group matches by league
     league_dict = {}
-    for m in matches[:10]:
+    for m in matches:
         league_name = m["competition"].get("name", "Unknown League")
         league_dict.setdefault(league_name, []).append(m)
 
@@ -214,7 +251,7 @@ async def matches_command(interaction: discord.Interaction):
         for m in league_matches:
             await post_match(m)
 
-    await interaction.response.send_message("✅ Posted upcoming matches!", ephemeral=True)
+    await interaction.response.send_message("✅ Posted upcoming matches for the next 24 hours!", ephemeral=True)
 
 @bot.tree.command(name="leaderboard", description="Show the leaderboard.")
 async def leaderboard_command(interaction: discord.Interaction):
@@ -239,11 +276,10 @@ async def on_ready():
 # ==== AUTO POST MATCHES ====
 @tasks.loop(minutes=30)
 async def auto_post_matches():
-    matches = await fetch_matches(days_ahead=7)
+    matches = await fetch_matches()
     if not matches:
         return
 
-    # Group matches by league
     league_dict = {}
     for m in matches:
         league_name = m["competition"].get("name", "Unknown League")
