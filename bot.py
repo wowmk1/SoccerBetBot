@@ -90,7 +90,49 @@ HEADERS = {"X-Auth-Token": FOOTBALL_DATA_API_KEY}
 COMPETITIONS = ["PL", "CL", "BL1", "PD", "FL1", "SA", "EC", "WC"]
 
 # ==== TRACK VOTES ====
-vote_data = {}  # match_id: {"home": set(), "draw": set(), "away": set(), "votes_msg_id": int, "locked_users": set(), "buttons_disabled": bool, "match_msg_id": int, "kickoff_time": datetime, "home_team": str, "away_team": str}
+VOTE_DATA_FILE = "vote_data.json"
+
+# Custom JSON encoder for sets and datetime
+class CustomEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, set):
+            return list(obj)
+        if isinstance(obj, datetime):
+            return obj.isoformat()
+        return super().default(obj)
+
+# Load vote_data from file
+try:
+    if os.path.exists(VOTE_DATA_FILE):
+        with open(VOTE_DATA_FILE, "r") as f:
+            loaded_data = json.load(f)
+            vote_data = {}
+            for match_id, data in loaded_data.items():
+                vote_data[match_id] = {
+                    "home": set(data.get("home", [])),
+                    "draw": set(data.get("draw", [])),
+                    "away": set(data.get("away", [])),
+                    "votes_msg_id": data.get("votes_msg_id"),
+                    "locked_users": set(data.get("locked_users", [])),
+                    "buttons_disabled": data.get("buttons_disabled", False),
+                    "match_msg_id": data.get("match_msg_id"),
+                    "kickoff_time": datetime.fromisoformat(data["kickoff_time"]) if data.get("kickoff_time") else None,
+                    "home_team": data.get("home_team", "Unknown"),
+                    "away_team": data.get("away_team", "Unknown")
+                }
+    else:
+        vote_data = {}
+except (json.JSONDecodeError, IOError, KeyError, ValueError) as e:
+    print(f"Warning: Could not load vote_data.json: {e}, starting fresh")
+    vote_data = {}
+
+def save_vote_data():
+    try:
+        with open(VOTE_DATA_FILE, "w") as f:
+            json.dump(vote_data, f, cls=CustomEncoder)
+    except Exception as e:
+        print(f"Error saving vote_data: {e}")
+
 last_leaderboard_msg_id = None
 active_views = {}  # Store active views by match_id
 
@@ -335,6 +377,7 @@ class PersistentMatchView(View):
             # Add the vote
             vote_data[match_id][vote_type].add(user.display_name)
             vote_data[match_id]["locked_users"].add(user_id)
+            save_vote_data()  # Save vote_data after modification
             
             # Update leaderboard data (synchronous)
             user_id_str = str(user_id)
@@ -482,12 +525,14 @@ async def post_match(match):
         "home_team": home_team,
         "away_team": away_team
     }
+    save_vote_data()  # Save vote_data after adding new match
     
     # CREATE INITIAL VOTES MESSAGE IMMEDIATELY
     try:
         initial_votes_embed = create_votes_embed(match_id)
         votes_message = await match_message.reply(embed=initial_votes_embed, mention_author=False)
         vote_data[match_id]["votes_msg_id"] = votes_message.id
+        save_vote_data()  # Save after adding votes_msg_id
         print(f"Created initial votes message for match {match_id}")
     except Exception as e:
         print(f"Error creating initial votes message: {e}")
@@ -532,6 +577,7 @@ async def check_voting_status():
                     
                     await match_message.edit(view=disabled_view)
                     data["buttons_disabled"] = True
+                    save_vote_data()  # Save after disabling buttons
                     
                     print(f"Disabled voting for match {match_id}")
                     
@@ -670,6 +716,7 @@ async def update_match_results():
                             
                             await match_message.edit(embed=finished_embed, view=disabled_view)
                             vote_data[match_id]["buttons_disabled"] = True
+                            save_vote_data()  # Save after marking as finished
                             
                 except Exception as e:
                     print(f"Error updating match result display for {match_id}: {e}")
