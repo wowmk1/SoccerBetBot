@@ -838,12 +838,16 @@ async def ticket_command(interaction: discord.Interaction):
     predictions = user_data.get("predictions", {})
     total_points = user_data.get("points", 0)
     
-    # Fetch match results from API for all user's predicted matches
+    # Fetch match results from API - search past 30 days and future 7 days
     match_details = {}
+    now = datetime.now(timezone.utc)
+    date_from = (now - timedelta(days=30)).date()
+    date_to = (now + timedelta(days=7)).date()
+    
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
         for comp in COMPETITIONS:
             try:
-                url = f"{BASE_URL}{comp}/matches"
+                url = f"{BASE_URL}{comp}/matches?dateFrom={date_from}&dateTo={date_to}"
                 async with session.get(url, headers=HEADERS) as resp:
                     if resp.status == 200:
                         data = await resp.json()
@@ -858,15 +862,13 @@ async def ticket_command(interaction: discord.Interaction):
     finished_bets = []
     upcoming_bets = []
     
-    now = datetime.now(timezone.utc)
     correct_predictions = 0
     total_finished = 0
     
     for match_id, prediction in predictions.items():
-        if match_id not in match_details and match_id not in vote_data:
-            continue
-            
         # Get match info from either API data or vote_data
+        match_found = False
+        
         if match_id in match_details:
             match = match_details[match_id]
             home_team = match["homeTeam"]["name"]
@@ -879,6 +881,8 @@ async def ticket_command(interaction: discord.Interaction):
                 kickoff_time = datetime.fromisoformat(match['utcDate'].replace("Z", "+00:00"))
             except:
                 kickoff_time = None
+            match_found = True
+            
         elif match_id in vote_data:
             match = vote_data[match_id]
             home_team = match.get("home_team", "Unknown")
@@ -887,7 +891,22 @@ async def ticket_command(interaction: discord.Interaction):
             status = "SCHEDULED"
             score_data = {}
             kickoff_time = match.get("kickoff_time")
-        else:
+            match_found = True
+        
+        # If match not found anywhere, create minimal entry
+        if not match_found:
+            bet_info = {
+                "home_team": "Unknown Match",
+                "away_team": "Unknown Match",
+                "competition": "Unknown",
+                "tip": {"home": "1", "draw": "X", "away": "2"}.get(prediction, "?"),
+                "prediction": prediction,
+                "kickoff": None,
+                "match_id": match_id,
+                "score": "N/A",
+                "correct": None
+            }
+            finished_bets.append(bet_info)
             continue
         
         # Convert prediction to display format
