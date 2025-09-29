@@ -1017,37 +1017,71 @@ async def ticket_command(interaction: discord.Interaction):
     # Add finished bets section
     if finished_bets:
         finished_text = []
-        for i, bet in enumerate(finished_bets[:10]):  # Show max 10 recent
+        char_count = 0
+        max_chars = 950  # Leave buffer under 1024 limit
+        shown_count = 0
+        
+        for i, bet in enumerate(finished_bets):
             status_icon = "✅" if bet.get("correct") else "❌" if bet.get("correct") is False else "❓"
             score = bet.get("score", "N/A")
             
-            finished_text.append(
+            bet_text = (
                 f"{status_icon} **{bet['home_team']} vs {bet['away_team']}**\n"
                 f"   🏆 {bet['competition']}\n"
-                f"   📋 Tip: **{bet['tip']}** | ⚽ Score: **{score}**"
+                f"   📋 Tip: **{bet['tip']}** | ⚽ Score: **{score}**\n\n"
             )
+            
+            # Check if adding this bet would exceed limit
+            if char_count + len(bet_text) > max_chars:
+                break
+            
+            finished_text.append(bet_text.rstrip())
+            char_count += len(bet_text)
+            shown_count += 1
+        
+        remaining = len(finished_bets) - shown_count
+        field_value = "\n\n".join(finished_text)
+        if remaining > 0:
+            field_value += f"\n\n*...and {remaining} more (use `/my_votes` for full list)*"
         
         embed.add_field(
             name=f"🏁 Finished Bets ({len(finished_bets)})",
-            value="\n\n".join(finished_text) + (f"\n\n*...and {len(finished_bets)-10} more*" if len(finished_bets) > 10 else ""),
+            value=field_value if field_value else "No finished bets yet",
             inline=False
         )
     
     # Add upcoming bets section
     if upcoming_bets:
         upcoming_text = []
-        for bet in upcoming_bets[:10]:  # Show max 10 upcoming
+        char_count = 0
+        max_chars = 950  # Leave buffer under 1024 limit
+        shown_count = 0
+        
+        for bet in upcoming_bets:
             kickoff_str = f"<t:{int(bet['kickoff'].timestamp())}:R>" if bet['kickoff'] else "TBD"
             
-            upcoming_text.append(
+            bet_text = (
                 f"⏳ **{bet['home_team']} vs {bet['away_team']}**\n"
                 f"   🏆 {bet['competition']}\n"
-                f"   📋 Tip: **{bet['tip']}** | 🕐 {kickoff_str}"
+                f"   📋 Tip: **{bet['tip']}** | 🕐 {kickoff_str}\n\n"
             )
+            
+            # Check if adding this bet would exceed limit
+            if char_count + len(bet_text) > max_chars:
+                break
+            
+            upcoming_text.append(bet_text.rstrip())
+            char_count += len(bet_text)
+            shown_count += 1
+        
+        remaining = len(upcoming_bets) - shown_count
+        field_value = "\n\n".join(upcoming_text)
+        if remaining > 0:
+            field_value += f"\n\n*...and {remaining} more (use `/my_votes` for full list)*"
         
         embed.add_field(
             name=f"📅 Upcoming Bets ({len(upcoming_bets)})",
-            value="\n\n".join(upcoming_text) + (f"\n\n*...and {len(upcoming_bets)-10} more*" if len(upcoming_bets) > 10 else ""),
+            value=field_value if field_value else "No upcoming bets",
             inline=False
         )
     
