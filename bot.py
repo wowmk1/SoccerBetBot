@@ -871,7 +871,7 @@ async def leaderboard_command(interaction: discord.Interaction):
     
     await interaction.response.send_message(embed=embed)
 
-@bot.tree.command(name="ticket", description="View your betting slip with all predictions and results.")
+@bot.tree.command(name="ticket", description="View your betting slip with predictions from the last 7 days.")
 async def ticket_command(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     
@@ -885,10 +885,10 @@ async def ticket_command(interaction: discord.Interaction):
     predictions = user_data.get("predictions", {})
     total_points = user_data.get("points", 0)
     
-    # Fetch match results from API - search past 30 days and future 7 days
+    # Fetch match results from API - last 7 days and future 7 days
     match_details = {}
     now = datetime.now(timezone.utc)
-    date_from = (now - timedelta(days=30)).date()
+    date_from = (now - timedelta(days=7)).date()
     date_to = (now + timedelta(days=7)).date()
     
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
@@ -905,12 +905,13 @@ async def ticket_command(interaction: discord.Interaction):
             except Exception as e:
                 print(f"Error fetching match details for {comp}: {e}")
     
-    # Separate finished and upcoming matches
+    # Separate finished and upcoming matches (last 7 days only)
     finished_bets = []
     upcoming_bets = []
     
     correct_predictions = 0
     total_finished = 0
+    seven_days_ago = now - timedelta(days=7)
     
     for match_id, prediction in predictions.items():
         # Get match info from either API data or vote_data
@@ -940,20 +941,11 @@ async def ticket_command(interaction: discord.Interaction):
             kickoff_time = match.get("kickoff_time")
             match_found = True
         
-        # If match not found anywhere, create minimal entry
+        # Skip if match not found or older than 7 days
         if not match_found:
-            bet_info = {
-                "home_team": "Unknown Match",
-                "away_team": "Unknown Match",
-                "competition": "Unknown",
-                "tip": {"home": "1", "draw": "X", "away": "2"}.get(prediction, "?"),
-                "prediction": prediction,
-                "kickoff": None,
-                "match_id": match_id,
-                "score": "N/A",
-                "correct": None
-            }
-            finished_bets.append(bet_info)
+            continue
+        
+        if kickoff_time and kickoff_time < seven_days_ago:
             continue
         
         # Convert prediction to display format
@@ -999,95 +991,101 @@ async def ticket_command(interaction: discord.Interaction):
         else:
             upcoming_bets.append(bet_info)
     
-    # Sort finished bets by most recent first
+    # Check if no bets in last 7 days
+    if not finished_bets and not upcoming_bets:
+        await interaction.followup.send(
+            "🎟️ No predictions found in the last 7 days.\n"
+            f"💰 Total Points: **{total_points}**\n"
+            f"Use `/matches` to bet on upcoming games!",
+            ephemeral=True
+        )
+        return
+    
+    # Sort bets
     finished_bets.sort(key=lambda x: x.get("kickoff", datetime.min.replace(tzinfo=timezone.utc)), reverse=True)
     upcoming_bets.sort(key=lambda x: x.get("kickoff", datetime.max.replace(tzinfo=timezone.utc)))
     
-    # Create betting slip embed
-    embed = discord.Embed(
-        title=f"🎟️ {user_data['name']}'s Betting Slip",
-        description=f"**📊 Overall Stats**\n"
-                    f"💰 Points: **{total_points}**\n"
-                    f"🎯 Win Rate: **{round((correct_predictions/total_finished*100) if total_finished > 0 else 0, 1)}%**\n"
-                    f"✅ Correct: **{correct_predictions}** | ❌ Wrong: **{total_finished - correct_predictions}** | ⏳ Pending: **{len(upcoming_bets)}**",
-        color=discord.Color.gold(),
-        timestamp=datetime.now(timezone.utc)
-    )
+    # Create multiple embeds if needed (split by 5 matches per embed)
+    embeds = []
+    max_bets_per_embed = 5
     
-    # Add finished bets section
+    # Calculate stats for header
+    total_bets_shown = len(finished_bets) + len(upcoming_bets)
+    
+    # Create finished bets embeds
     if finished_bets:
-        finished_text = []
-        char_count = 0
-        max_chars = 950  # Leave buffer under 1024 limit
-        shown_count = 0
-        
-        for i, bet in enumerate(finished_bets):
-            status_icon = "✅" if bet.get("correct") else "❌" if bet.get("correct") is False else "❓"
-            score = bet.get("score", "N/A")
+        for i in range(0, len(finished_bets), max_bets_per_embed):
+            chunk = finished_bets[i:i + max_bets_per_embed]
             
-            bet_text = (
-                f"{status_icon} **{bet['home_team']} vs {bet['away_team']}**\n"
-                f"   🏆 {bet['competition']}\n"
-                f"   📋 Tip: **{bet['tip']}** | ⚽ Score: **{score}**\n\n"
+            embed = discord.Embed(
+                title=f"🎟️ {user_data['name']}'s Betting Slip - Finished Bets" + (f" (Page {i//max_bets_per_embed + 1})" if len(finished_bets) > max_bets_per_embed else ""),
+                description=f"**📊 Stats (Last 7 Days)**\n"
+                            f"💰 Total Points: **{total_points}**\n"
+                            f"🎯 Win Rate: **{round((correct_predictions/total_finished*100) if total_finished > 0 else 0, 1)}%**\n"
+                            f"✅ Correct: **{correct_predictions}** | ❌ Wrong: **{total_finished - correct_predictions}** | ⏳ Pending: **{len(upcoming_bets)}**",
+                color=discord.Color.gold(),
+                timestamp=datetime.now(timezone.utc)
             )
             
-            # Check if adding this bet would exceed limit
-            if char_count + len(bet_text) > max_chars:
-                break
+            finished_text = []
+            for bet in chunk:
+                status_icon = "✅" if bet.get("correct") else "❌" if bet.get("correct") is False else "❓"
+                score = bet.get("score", "N/A")
+                
+                finished_text.append(
+                    f"{status_icon} **{bet['home_team']} vs {bet['away_team']}**\n"
+                    f"   🏆 {bet['competition']}\n"
+                    f"   📋 Tip: **{bet['tip']}** | ⚽ Score: **{score}**"
+                )
             
-            finished_text.append(bet_text.rstrip())
-            char_count += len(bet_text)
-            shown_count += 1
-        
-        remaining = len(finished_bets) - shown_count
-        field_value = "\n\n".join(finished_text)
-        if remaining > 0:
-            field_value += f"\n\n*...and {remaining} more (use `/my_votes` for full list)*"
-        
-        embed.add_field(
-            name=f"🏁 Finished Bets ({len(finished_bets)})",
-            value=field_value if field_value else "No finished bets yet",
-            inline=False
-        )
+            embed.add_field(
+                name=f"🏁 Finished ({len(finished_bets)} total)",
+                value="\n\n".join(finished_text),
+                inline=False
+            )
+            
+            embed.set_footer(text=f"🎟️ Betting Slip • Last 7 Days • Generated")
+            embeds.append(embed)
     
-    # Add upcoming bets section
+    # Create upcoming bets embeds
     if upcoming_bets:
-        upcoming_text = []
-        char_count = 0
-        max_chars = 950  # Leave buffer under 1024 limit
-        shown_count = 0
-        
-        for bet in upcoming_bets:
-            kickoff_str = f"<t:{int(bet['kickoff'].timestamp())}:R>" if bet['kickoff'] else "TBD"
+        for i in range(0, len(upcoming_bets), max_bets_per_embed):
+            chunk = upcoming_bets[i:i + max_bets_per_embed]
             
-            bet_text = (
-                f"⏳ **{bet['home_team']} vs {bet['away_team']}**\n"
-                f"   🏆 {bet['competition']}\n"
-                f"   📋 Tip: **{bet['tip']}** | 🕐 {kickoff_str}\n\n"
+            embed = discord.Embed(
+                title=f"🎟️ {user_data['name']}'s Betting Slip - Upcoming Bets" + (f" (Page {i//max_bets_per_embed + 1})" if len(upcoming_bets) > max_bets_per_embed else ""),
+                description=f"**📊 Stats (Last 7 Days)**\n"
+                            f"💰 Total Points: **{total_points}**\n"
+                            f"🎯 Win Rate: **{round((correct_predictions/total_finished*100) if total_finished > 0 else 0, 1)}%**\n"
+                            f"✅ Correct: **{correct_predictions}** | ❌ Wrong: **{total_finished - correct_predictions}** | ⏳ Pending: **{len(upcoming_bets)}**",
+                color=discord.Color.blue(),
+                timestamp=datetime.now(timezone.utc)
             )
             
-            # Check if adding this bet would exceed limit
-            if char_count + len(bet_text) > max_chars:
-                break
+            upcoming_text = []
+            for bet in chunk:
+                kickoff_str = f"<t:{int(bet['kickoff'].timestamp())}:R>" if bet['kickoff'] else "TBD"
+                
+                upcoming_text.append(
+                    f"⏳ **{bet['home_team']} vs {bet['away_team']}**\n"
+                    f"   🏆 {bet['competition']}\n"
+                    f"   📋 Tip: **{bet['tip']}** | 🕐 {kickoff_str}"
+                )
             
-            upcoming_text.append(bet_text.rstrip())
-            char_count += len(bet_text)
-            shown_count += 1
-        
-        remaining = len(upcoming_bets) - shown_count
-        field_value = "\n\n".join(upcoming_text)
-        if remaining > 0:
-            field_value += f"\n\n*...and {remaining} more (use `/my_votes` for full list)*"
-        
-        embed.add_field(
-            name=f"📅 Upcoming Bets ({len(upcoming_bets)})",
-            value=field_value if field_value else "No upcoming bets",
-            inline=False
-        )
+            embed.add_field(
+                name=f"📅 Upcoming ({len(upcoming_bets)} total)",
+                value="\n\n".join(upcoming_text),
+                inline=False
+            )
+            
+            embed.set_footer(text=f"🎟️ Betting Slip • Next 7 Days • Generated")
+            embeds.append(embed)
     
-    embed.set_footer(text="🎟️ Betting Slip • Generated")
-    
-    await interaction.followup.send(embed=embed, ephemeral=True)
+    # Send all embeds
+    if embeds:
+        await interaction.followup.send(embeds=embeds, ephemeral=True)
+    else:
+        await interaction.followup.send("🎟️ No bets found in the last 7 days.", ephemeral=True)
 
 @bot.tree.command(name="my_votes", description="Check your current predictions.")
 async def my_votes_command(interaction: discord.Interaction):
