@@ -1292,6 +1292,47 @@ async def debug_points_command(interaction: discord.Interaction):
     
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
+@bot.tree.command(name="debug_ticket", description="Debug ticket data (Admin only).")
+async def debug_ticket_command(interaction: discord.Interaction):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Admin only command.", ephemeral=True)
+        return
+    
+    user_id = str(interaction.user.id)
+    
+    embed = discord.Embed(title="🔍 Ticket Debug", color=discord.Color.orange())
+    
+    # Check if user exists in leaderboard
+    if user_id in leaderboard:
+        user_data = leaderboard[user_id]
+        embed.add_field(name="User Found", value="✅ Yes", inline=True)
+        embed.add_field(name="User Name", value=user_data.get("name", "N/A"), inline=True)
+        embed.add_field(name="Points", value=str(user_data.get("points", 0)), inline=True)
+        
+        predictions = user_data.get("predictions", {})
+        embed.add_field(name="Predictions Count", value=str(len(predictions)), inline=True)
+        
+        if predictions:
+            pred_list = []
+            for match_id, pred in list(predictions.items())[:5]:
+                pred_list.append(f"Match {match_id}: {pred}")
+            embed.add_field(name="Sample Predictions", value="\n".join(pred_list) or "None", inline=False)
+    else:
+        embed.add_field(name="User Found", value="❌ No", inline=True)
+    
+    # Show all users in leaderboard
+    total_users = len(leaderboard)
+    users_with_predictions = len([u for u in leaderboard.values() if u.get("predictions")])
+    
+    embed.add_field(name="Total Users in Leaderboard", value=str(total_users), inline=True)
+    embed.add_field(name="Users with Predictions", value=str(users_with_predictions), inline=True)
+    
+    # Show sample user IDs
+    sample_ids = list(leaderboard.keys())[:3]
+    embed.add_field(name="Sample User IDs", value="\n".join(sample_ids) or "None", inline=False)
+    
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
 @bot.tree.command(name="reset_points", description="Reset points and recalculate (Admin only).")
 async def reset_points_command(interaction: discord.Interaction):
     if not interaction.user.guild_permissions.administrator:
