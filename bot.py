@@ -824,6 +824,171 @@ async def leaderboard_command(interaction: discord.Interaction):
     
     await interaction.response.send_message(embed=embed)
 
+@bot.tree.command(name="ticket", description="View your betting slip with all predictions and results.")
+async def ticket_command(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    
+    user_id = str(interaction.user.id)
+    
+    if user_id not in leaderboard or not leaderboard[user_id].get("predictions"):
+        await interaction.followup.send("🎟️ You don't have any predictions yet! Use `/matches` to start betting.", ephemeral=True)
+        return
+    
+    user_data = leaderboard[user_id]
+    predictions = user_data.get("predictions", {})
+    total_points = user_data.get("points", 0)
+    
+    # Fetch match results from API for all user's predicted matches
+    match_details = {}
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
+        for comp in COMPETITIONS:
+            try:
+                url = f"{BASE_URL}{comp}/matches"
+                async with session.get(url, headers=HEADERS) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        for m in data.get("matches", []):
+                            match_id = str(m["id"])
+                            if match_id in predictions:
+                                match_details[match_id] = m
+            except Exception as e:
+                print(f"Error fetching match details for {comp}: {e}")
+    
+    # Separate finished and upcoming matches
+    finished_bets = []
+    upcoming_bets = []
+    
+    now = datetime.now(timezone.utc)
+    correct_predictions = 0
+    total_finished = 0
+    
+    for match_id, prediction in predictions.items():
+        if match_id not in match_details and match_id not in vote_data:
+            continue
+            
+        # Get match info from either API data or vote_data
+        if match_id in match_details:
+            match = match_details[match_id]
+            home_team = match["homeTeam"]["name"]
+            away_team = match["awayTeam"]["name"]
+            competition = match.get("competition", {}).get("name", "Unknown")
+            status = match.get("status")
+            score_data = match.get("score", {})
+            
+            try:
+                kickoff_time = datetime.fromisoformat(match['utcDate'].replace("Z", "+00:00"))
+            except:
+                kickoff_time = None
+        elif match_id in vote_data:
+            match = vote_data[match_id]
+            home_team = match.get("home_team", "Unknown")
+            away_team = match.get("away_team", "Unknown")
+            competition = "Unknown"
+            status = "SCHEDULED"
+            score_data = {}
+            kickoff_time = match.get("kickoff_time")
+        else:
+            continue
+        
+        # Convert prediction to display format
+        tip_display = {"home": "1", "draw": "X", "away": "2"}
+        user_tip = tip_display.get(prediction, "?")
+        
+        bet_info = {
+            "home_team": home_team,
+            "away_team": away_team,
+            "competition": competition,
+            "tip": user_tip,
+            "prediction": prediction,
+            "kickoff": kickoff_time,
+            "match_id": match_id
+        }
+        
+        # Check if match is finished
+        if status == "FINISHED":
+            total_finished += 1
+            fulltime = score_data.get("fullTime", {})
+            home_score = fulltime.get("home")
+            away_score = fulltime.get("away")
+            
+            if home_score is not None and away_score is not None:
+                bet_info["score"] = f"{home_score} - {away_score}"
+                
+                # Determine actual result
+                if home_score > away_score:
+                    actual_result = "home"
+                elif away_score > home_score:
+                    actual_result = "away"
+                else:
+                    actual_result = "draw"
+                
+                bet_info["correct"] = (actual_result == prediction)
+                if bet_info["correct"]:
+                    correct_predictions += 1
+            else:
+                bet_info["score"] = "N/A"
+                bet_info["correct"] = None
+                
+            finished_bets.append(bet_info)
+        else:
+            upcoming_bets.append(bet_info)
+    
+    # Sort finished bets by most recent first
+    finished_bets.sort(key=lambda x: x.get("kickoff", datetime.min.replace(tzinfo=timezone.utc)), reverse=True)
+    upcoming_bets.sort(key=lambda x: x.get("kickoff", datetime.max.replace(tzinfo=timezone.utc)))
+    
+    # Create betting slip embed
+    embed = discord.Embed(
+        title=f"🎟️ {user_data['name']}'s Betting Slip",
+        description=f"**📊 Overall Stats**\n"
+                    f"💰 Points: **{total_points}**\n"
+                    f"🎯 Win Rate: **{round((correct_predictions/total_finished*100) if total_finished > 0 else 0, 1)}%**\n"
+                    f"✅ Correct: **{correct_predictions}** | ❌ Wrong: **{total_finished - correct_predictions}** | ⏳ Pending: **{len(upcoming_bets)}**",
+        color=discord.Color.gold(),
+        timestamp=datetime.now(timezone.utc)
+    )
+    
+    # Add finished bets section
+    if finished_bets:
+        finished_text = []
+        for i, bet in enumerate(finished_bets[:10]):  # Show max 10 recent
+            status_icon = "✅" if bet.get("correct") else "❌" if bet.get("correct") is False else "❓"
+            score = bet.get("score", "N/A")
+            
+            finished_text.append(
+                f"{status_icon} **{bet['home_team']} vs {bet['away_team']}**\n"
+                f"   🏆 {bet['competition']}\n"
+                f"   📋 Tip: **{bet['tip']}** | ⚽ Score: **{score}**"
+            )
+        
+        embed.add_field(
+            name=f"🏁 Finished Bets ({len(finished_bets)})",
+            value="\n\n".join(finished_text) + (f"\n\n*...and {len(finished_bets)-10} more*" if len(finished_bets) > 10 else ""),
+            inline=False
+        )
+    
+    # Add upcoming bets section
+    if upcoming_bets:
+        upcoming_text = []
+        for bet in upcoming_bets[:10]:  # Show max 10 upcoming
+            kickoff_str = f"<t:{int(bet['kickoff'].timestamp())}:R>" if bet['kickoff'] else "TBD"
+            
+            upcoming_text.append(
+                f"⏳ **{bet['home_team']} vs {bet['away_team']}**\n"
+                f"   🏆 {bet['competition']}\n"
+                f"   📋 Tip: **{bet['tip']}** | 🕐 {kickoff_str}"
+            )
+        
+        embed.add_field(
+            name=f"📅 Upcoming Bets ({len(upcoming_bets)})",
+            value="\n\n".join(upcoming_text) + (f"\n\n*...and {len(upcoming_bets)-10} more*" if len(upcoming_bets) > 10 else ""),
+            inline=False
+        )
+    
+    embed.set_footer(text="🎟️ Betting Slip • Generated")
+    
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
 @bot.tree.command(name="my_votes", description="Check your current predictions.")
 async def my_votes_command(interaction: discord.Interaction):
     user_id = str(interaction.user.id)
@@ -1020,6 +1185,7 @@ async def help_command(interaction: discord.Interaction):
         value=(
             "`/matches` - Post upcoming matches (48 hours)\n"
             "`/leaderboard` - View current rankings\n"
+            "`/ticket` - View your betting slip\n"
             "`/my_votes` - Check your predictions\n"
             "`/match_status` - See active matches\n"
             "`/stats` - Bot statistics\n"
