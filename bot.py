@@ -556,7 +556,7 @@ async def fetch_all_match_results():
     
     results = {}
     async with aiohttp.ClientSession() as session:
-        for comp in COMPETITIONS:
+        for i, comp in enumerate(COMPETITIONS):
             url = f"{BASE_URL}{comp}/matches"
             try:
                 async with session.get(url, headers=HEADERS, timeout=aiohttp.ClientTimeout(total=10)) as resp:
@@ -576,8 +576,18 @@ async def fetch_all_match_results():
                                         "home_score": home_score,
                                         "away_score": away_score
                                     }
+                    elif resp.status == 429:
+                        print(f"Rate limited! Waiting 60 seconds...")
+                        await asyncio.sleep(60)
+                        continue
+                    else:
+                        print(f"Failed to fetch results for {comp}: {resp.status}")
             except Exception as e:
                 print(f"Error fetching results for {comp}: {e}")
+            
+            # Add delay between API calls to avoid rate limiting
+            if i < len(COMPETITIONS) - 1:
+                await asyncio.sleep(1)
     
     match_results_cache = results
     cache_timestamp = datetime.now(timezone.utc)
@@ -706,7 +716,7 @@ async def post_match(match):
         print(f"Failed to post match {match_id}: {e}")
 
 # ==== UPDATE MATCH RESULTS ====
-@tasks.loop(minutes=5)
+@tasks.loop(minutes=10)  # Changed from 5 to 10 minutes
 async def update_match_results():
     global last_leaderboard_msg_id
     leaderboard_changed = False
@@ -716,7 +726,23 @@ async def update_match_results():
         cur.execute("SELECT user_id, points FROM users")
         previous_points = {row['user_id']: row['points'] for row in cur.fetchall()}
     
-    # Fetch fresh results
+    # Only fetch results if we have unprocessed matches
+    with db_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT COUNT(*) as count FROM posted_matches pm
+            WHERE pm.status != 'FINISHED'
+            AND pm.match_time < NOW()
+            AND NOT EXISTS (
+                SELECT 1 FROM processed_matches proc WHERE proc.match_id = pm.match_id
+            )
+        """)
+        unprocessed_count = cur.fetchone()['count']
+    
+    if unprocessed_count == 0:
+        # No pending matches to check, skip API calls
+        return
+    
     results = await fetch_all_match_results()
     
     for match_id, result_data in results.items():
