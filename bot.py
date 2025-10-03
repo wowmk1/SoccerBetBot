@@ -1094,7 +1094,7 @@ async def fixdb_command(interaction: discord.Interaction):
         
         await interaction.followup.send("Database schema updated successfully!", ephemeral=True)
     except Exception as e:
-        await interaction.followup.send(f"Error: {str(e)}", ephemeral=True)eral=True)
+        await interaction.followup.send(f"Error: {str(e)}", ephemeral=True)
     except Exception as e:
         await interaction.followup.send(f"Error: {str(e)}", ephemeral=True)
 
