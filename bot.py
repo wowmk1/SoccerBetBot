@@ -52,7 +52,9 @@ def init_db():
             CREATE TABLE IF NOT EXISTS users (
                 user_id TEXT PRIMARY KEY,
                 username TEXT NOT NULL,
-                points INTEGER DEFAULT 0
+                points INTEGER DEFAULT 0,
+                current_streak INTEGER DEFAULT 0,
+                best_streak INTEGER DEFAULT 0
             )
         """)
         
@@ -77,7 +79,8 @@ def init_db():
                 home_score INTEGER,
                 away_score INTEGER,
                 status TEXT DEFAULT 'SCHEDULED',
-                posted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                posted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                notification_sent BOOLEAN DEFAULT FALSE
             )
         """)
         
@@ -94,6 +97,16 @@ def init_db():
             CREATE TABLE IF NOT EXISTS processed_matches (
                 match_id TEXT PRIMARY KEY,
                 processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS weekly_stats (
+                user_id TEXT NOT NULL,
+                week_start DATE NOT NULL,
+                correct INTEGER DEFAULT 0,
+                total INTEGER DEFAULT 0,
+                PRIMARY KEY (user_id, week_start)
             )
         """)
         
@@ -134,6 +147,126 @@ def add_prediction(user_id, match_id, prediction):
             ON CONFLICT (user_id, match_id) DO NOTHING
         """, (user_id, match_id, prediction))
         conn.commit()
+
+def update_prediction(user_id, match_id, new_prediction):
+    """Update existing prediction"""
+    with db_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE predictions
+            SET prediction = %s
+            WHERE user_id = %s AND match_id = %s
+        """, (new_prediction, user_id, match_id))
+        conn.commit()
+        return cur.rowcount > 0
+
+def delete_prediction(user_id, match_id):
+    """Delete a prediction"""
+    with db_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM predictions WHERE user_id = %s AND match_id = %s", (user_id, match_id))
+        conn.commit()
+        return cur.rowcount > 0
+
+def update_user_streak(user_id, is_correct):
+    """Update user's streak"""
+    with db_connection() as conn:
+        cur = conn.cursor()
+        
+        if is_correct:
+            cur.execute("""
+                UPDATE users 
+                SET current_streak = current_streak + 1,
+                    best_streak = GREATEST(best_streak, current_streak + 1)
+                WHERE user_id = %s
+            """, (user_id,))
+        else:
+            cur.execute("UPDATE users SET current_streak = 0 WHERE user_id = %s", (user_id,))
+        
+        conn.commit()
+
+def get_user_streaks(user_id):
+    """Get user streak info"""
+    with db_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT current_streak, best_streak FROM users WHERE user_id = %s", (user_id,))
+        result = cur.fetchone()
+        return result if result else {"current_streak": 0, "best_streak": 0}
+
+def record_weekly_stat(user_id, is_correct):
+    """Record weekly statistics"""
+    with db_connection() as conn:
+        cur = conn.cursor()
+        today = datetime.now(timezone.utc).date()
+        week_start = today - timedelta(days=today.weekday())  # Monday
+        
+        if is_correct:
+            cur.execute("""
+                INSERT INTO weekly_stats (user_id, week_start, correct, total)
+                VALUES (%s, %s, 1, 1)
+                ON CONFLICT (user_id, week_start) 
+                DO UPDATE SET correct = weekly_stats.correct + 1, total = weekly_stats.total + 1
+            """, (user_id, week_start))
+        else:
+            cur.execute("""
+                INSERT INTO weekly_stats (user_id, week_start, correct, total)
+                VALUES (%s, %s, 0, 1)
+                ON CONFLICT (user_id, week_start) 
+                DO UPDATE SET total = weekly_stats.total + 1
+            """, (user_id, week_start))
+        
+        conn.commit()
+
+def get_weekly_stats(user_id, week_start):
+    """Get stats for a specific week"""
+    with db_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT correct, total FROM weekly_stats 
+            WHERE user_id = %s AND week_start = %s
+        """, (user_id, week_start))
+        result = cur.fetchone()
+        return result if result else {"correct": 0, "total": 0}
+
+def get_last_week_stats():
+    """Get all users' stats from last week"""
+    with db_connection() as conn:
+        cur = conn.cursor()
+        today = datetime.now(timezone.utc).date()
+        last_week_start = today - timedelta(days=today.weekday() + 7)
+        
+        cur.execute("""
+            SELECT u.user_id, u.username, ws.correct, ws.total
+            FROM weekly_stats ws
+            JOIN users u ON ws.user_id = u.user_id
+            WHERE ws.week_start = %s AND ws.total > 0
+            ORDER BY ws.correct DESC, ws.total ASC
+        """, (last_week_start,))
+        return cur.fetchall()
+
+def mark_notification_sent(match_id):
+    """Mark that notification was sent for this match"""
+    with db_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("UPDATE posted_matches SET notification_sent = TRUE WHERE match_id = %s", (match_id,))
+        conn.commit()
+
+def get_upcoming_matches_for_notification():
+    """Get matches starting in 10-15 minutes that haven't been notified"""
+    with db_connection() as conn:
+        cur = conn.cursor()
+        now = datetime.now(timezone.utc)
+        start_window = now + timedelta(minutes=10)
+        end_window = now + timedelta(minutes=15)
+        
+        cur.execute("""
+            SELECT match_id, home_team, away_team, match_time
+            FROM posted_matches
+            WHERE match_time BETWEEN %s AND %s
+            AND notification_sent = FALSE
+            AND status = 'SCHEDULED'
+        """, (start_window, end_window))
+        return cur.fetchall()
 
 def get_predictions_for_match(match_id):
     """Get all predictions for a match grouped by prediction type"""
@@ -463,10 +596,36 @@ class VoteButton(Button):
         user_id = str(user.id)
         match_id = self.match_id
         
-        if user_has_prediction(user_id, match_id):
-            await interaction.response.send_message("You have already voted!", ephemeral=True)
-            return
+        # Check if user already has a prediction
+        existing_prediction = get_user_prediction(user_id, match_id)
         
+        if existing_prediction:
+            if existing_prediction == self.category:
+                await interaction.response.send_message(f"You already voted for **{self.label}**!", ephemeral=True)
+                return
+            else:
+                # Update prediction
+                upsert_user(user_id, user.name)
+                update_prediction(user_id, match_id, self.category)
+                
+                # Get match info for live predictions
+                match_data = get_match_info(match_id)
+                
+                # Update live predictions embed
+                if match_data:
+                    live_msg_id = get_live_predictions_message_id(match_id)
+                    if live_msg_id:
+                        try:
+                            live_message = await interaction.channel.fetch_message(live_msg_id)
+                            embed = create_live_predictions_embed(match_id, match_data['home_team'], match_data['away_team'])
+                            await live_message.edit(embed=embed)
+                        except Exception as e:
+                            print(f"Failed to update live predictions: {e}")
+                
+                await interaction.response.send_message(f"Changed your vote to **{self.label}**!", ephemeral=True)
+                return
+        
+        # New prediction
         upsert_user(user_id, user.name)
         add_prediction(user_id, match_id, self.category)
         
@@ -579,7 +738,22 @@ async def update_match_results():
         
         for winner in winners:
             add_points(winner['user_id'], 1)
+            update_user_streak(winner['user_id'], is_correct=True)
+            record_weekly_stat(winner['user_id'], is_correct=True)
             leaderboard_changed = True
+        
+        # Update streaks for losers
+        with db_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT DISTINCT user_id FROM predictions
+                WHERE match_id = %s AND prediction != %s
+            """, (match_id, result))
+            losers = cur.fetchall()
+        
+        for loser in losers:
+            update_user_streak(loser['user_id'], is_correct=False)
+            record_weekly_stat(loser['user_id'], is_correct=False)
         
         # Mark match as processed
         mark_match_processed(match_id)
@@ -614,6 +788,10 @@ async def update_match_results():
                     await live_message.edit(embed=embed)
                 except Exception as e:
                     print(f"Failed to update final score for {match_id}: {e}")
+        
+        # Check for streak milestones and notify
+        if winners:
+            await check_streak_milestones(winners)
     
     if leaderboard_changed:
         channel = bot.get_channel(LEADERBOARD_CHANNEL_ID)
@@ -640,6 +818,168 @@ async def update_match_results():
             print(f"Failed to update leaderboard: {e}")
             msg = await channel.send(embed=embed)
             last_leaderboard_msg_id = msg.id
+
+async def check_streak_milestones(winners):
+    """Check if any winners hit streak milestones and notify"""
+    channel = bot.get_channel(MATCH_CHANNEL_ID)
+    if not channel:
+        return
+    
+    for winner in winners:
+        streaks = get_user_streaks(winner['user_id'])
+        current = streaks['current_streak']
+        
+        # Notify on milestones: 3, 5, 10, 15, 20, etc.
+        if current in [3, 5, 10, 15, 20, 25, 30]:
+            user_data = get_user(winner['user_id'])
+            if user_data:
+                try:
+                    embed = discord.Embed(
+                        title=f"🔥 Streak Alert!",
+                        description=f"**{user_data['username']}** is on fire with a **{current}-game win streak!**",
+                        color=discord.Color.orange()
+                    )
+                    await channel.send(embed=embed)
+                except Exception as e:
+                    print(f"Failed to send streak notification: {e}")
+
+# ==== MATCH NOTIFICATIONS ====
+@tasks.loop(minutes=2)
+async def send_match_notifications():
+    """Send notifications for matches starting soon"""
+    matches = get_upcoming_matches_for_notification()
+    
+    if not matches:
+        return
+    
+    channel = bot.get_channel(MATCH_CHANNEL_ID)
+    if not channel:
+        return
+    
+    for match in matches:
+        # Get users who haven't voted
+        with db_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT u.user_id, u.username
+                FROM users u
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM predictions p 
+                    WHERE p.user_id = u.user_id AND p.match_id = %s
+                )
+            """, (match['match_id'],))
+            non_voters = cur.fetchall()
+        
+        if non_voters and len(non_voters) > 0:
+            mentions = " ".join([f"<@{user['user_id']}>" for user in non_voters[:10]])  # Limit to 10 mentions
+            
+            embed = discord.Embed(
+                title="⏰ Match Starting Soon!",
+                description=f"**{match['home_team']} vs {match['away_team']}**\nKickoff in ~10 minutes!",
+                color=discord.Color.red()
+            )
+            embed.add_field(
+                name="🔮 Haven't Voted Yet",
+                value=f"{len(non_voters)} player(s) haven't made predictions!",
+                inline=False
+            )
+            
+            try:
+                await channel.send(content=mentions if len(non_voters) <= 10 else None, embed=embed)
+            except Exception as e:
+                print(f"Failed to send notification: {e}")
+        
+        mark_notification_sent(match['match_id'])
+
+# ==== WEEKLY RECAP ====
+@tasks.loop(hours=24)
+async def weekly_recap():
+    """Send weekly recap every Monday"""
+    now = datetime.now(timezone.utc)
+    
+    # Only run on Mondays at approximately the scheduled time
+    if now.weekday() != 0:  # 0 = Monday
+        return
+    
+    last_week_stats = get_last_week_stats()
+    
+    if not last_week_stats:
+        return
+    
+    channel = bot.get_channel(LEADERBOARD_CHANNEL_ID)
+    if not channel:
+        return
+    
+    embed = discord.Embed(
+        title="📊 Weekly Recap",
+        description="Last week's prediction results are in!",
+        color=discord.Color.purple()
+    )
+    
+    # Top performers
+    top_5 = last_week_stats[:5]
+    top_text = []
+    for i, user in enumerate(top_5):
+        accuracy = (user['correct'] / user['total'] * 100) if user['total'] > 0 else 0
+        medals = ["🥇", "🥈", "🥉", "4.", "5."]
+        medal = medals[i] if i < len(medals) else f"{i+1}."
+        top_text.append(f"{medal} **{user['username']}** — {user['correct']}/{user['total']} ({accuracy:.0f}%)")
+    
+    embed.add_field(
+        name="🏆 Top Predictors",
+        value="\n".join(top_text),
+        inline=False
+    )
+    
+    # Overall stats
+    total_predictions = sum(u['total'] for u in last_week_stats)
+    total_correct = sum(u['correct'] for u in last_week_stats)
+    overall_accuracy = (total_correct / total_predictions * 100) if total_predictions > 0 else 0
+    
+    embed.add_field(
+        name="📈 Community Stats",
+        value=f"**Total Predictions:** {total_predictions}\n"
+              f"**Correct:** {total_correct}\n"
+              f"**Overall Accuracy:** {overall_accuracy:.1f}%",
+        inline=False
+    )
+    
+    # Individual DMs to active users
+    for user_stat in last_week_stats:
+        if user_stat['total'] >= 3:  # Only DM users with 3+ predictions
+            try:
+                user = await bot.fetch_user(int(user_stat['user_id']))
+                accuracy = (user_stat['correct'] / user_stat['total'] * 100)
+                
+                dm_embed = discord.Embed(
+                    title="📊 Your Week in Review",
+                    description=f"Here's how you did last week!",
+                    color=discord.Color.blue()
+                )
+                dm_embed.add_field(
+                    name="🎯 Your Stats",
+                    value=f"**Correct:** {user_stat['correct']}/{user_stat['total']}\n"
+                          f"**Accuracy:** {accuracy:.1f}%",
+                    inline=False
+                )
+                
+                # Rank
+                rank = next((i+1 for i, u in enumerate(last_week_stats) if u['user_id'] == user_stat['user_id']), None)
+                if rank:
+                    dm_embed.add_field(
+                        name="🏅 Weekly Rank",
+                        value=f"#{rank} out of {len(last_week_stats)} players",
+                        inline=False
+                    )
+                
+                await user.send(embed=dm_embed)
+            except Exception as e:
+                print(f"Failed to send DM to user {user_stat['user_id']}: {e}")
+    
+    try:
+        await channel.send(embed=embed)
+    except Exception as e:
+        print(f"Failed to send weekly recap: {e}")
 
 # ==== ADMIN COMMANDS ====
 @bot.tree.command(name="backup", description="[ADMIN] Backup all data to JSON")
@@ -707,9 +1047,23 @@ async def fixdb_command(interaction: discord.Interaction):
             cur.execute("ALTER TABLE posted_matches ADD COLUMN IF NOT EXISTS home_score INTEGER")
             cur.execute("ALTER TABLE posted_matches ADD COLUMN IF NOT EXISTS away_score INTEGER")
             cur.execute("ALTER TABLE posted_matches ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'SCHEDULED'")
+            cur.execute("ALTER TABLE posted_matches ADD COLUMN IF NOT EXISTS notification_sent BOOLEAN DEFAULT FALSE")
+            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS current_streak INTEGER DEFAULT 0")
+            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS best_streak INTEGER DEFAULT 0")
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS weekly_stats (
+                    user_id TEXT NOT NULL,
+                    week_start DATE NOT NULL,
+                    correct INTEGER DEFAULT 0,
+                    total INTEGER DEFAULT 0,
+                    PRIMARY KEY (user_id, week_start)
+                )
+            """)
             conn.commit()
         
         await interaction.followup.send("Database schema updated successfully!", ephemeral=True)
+    except Exception as e:
+        await interaction.followup.send(f"Error: {str(e)}", ephemeral=True)eral=True)
     except Exception as e:
         await interaction.followup.send(f"Error: {str(e)}", ephemeral=True)
 
@@ -963,12 +1317,389 @@ async def ticket_command(interaction: discord.Interaction, user: discord.Member 
     for embed in embeds[1:]:
         await interaction.followup.send(embed=embed, ephemeral=True)
 
+@bot.tree.command(name="mystats", description="Show your detailed statistics")
+async def mystats_command(interaction: discord.Interaction):
+    user_id = str(interaction.user.id)
+    user_data = get_user(user_id)
+    
+    if not user_data:
+        await interaction.response.send_message("You haven't made any predictions yet!", ephemeral=True)
+        return
+    
+    stats = get_user_stats(user_id)
+    streaks = get_user_streaks(user_id)
+    
+    # Get breakdown by competition
+    with db_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT pm.competition, COUNT(*) as total,
+                   SUM(CASE WHEN proc.match_id IS NOT NULL THEN 1 ELSE 0 END) as finished
+            FROM predictions p
+            LEFT JOIN posted_matches pm ON p.match_id = pm.match_id
+            LEFT JOIN processed_matches proc ON p.match_id = proc.match_id
+            WHERE p.user_id = %s AND pm.competition IS NOT NULL
+            GROUP BY pm.competition
+            ORDER BY total DESC
+        """, (user_id,))
+        comp_breakdown = cur.fetchall()
+    
+    embed = discord.Embed(
+        title=f"📊 {interaction.user.name}'s Statistics",
+        color=discord.Color.blue()
+    )
+    
+    # Overall stats
+    embed.add_field(
+        name="🎯 Overall",
+        value=f"**Points:** {user_data['points']}\n"
+              f"**Total Predictions:** {stats['total']}\n"
+              f"**Correct:** {stats['correct']}\n"
+              f"**Accuracy:** {stats['accuracy']:.1f}%",
+        inline=False
+    )
+    
+    # Streaks
+    streak_emoji = "🔥" if streaks['current_streak'] >= 3 else "📈"
+    embed.add_field(
+        name=f"{streak_emoji} Streaks",
+        value=f"**Current Streak:** {streaks['current_streak']}\n"
+              f"**Best Streak:** {streaks['best_streak']}",
+        inline=False
+    )
+    
+    # Competition breakdown
+    if comp_breakdown:
+        comp_text = []
+        for comp in comp_breakdown[:5]:  # Top 5 competitions
+            comp_text.append(f"**{comp['competition']}:** {comp['total']} predictions")
+        
+        embed.add_field(
+            name="🏆 By Competition",
+            value="\n".join(comp_text),
+            inline=False
+        )
+    
+    # Leaderboard position
+    leaderboard = get_leaderboard()
+    position = next((i+1 for i, entry in enumerate(leaderboard) if entry['user_id'] == user_id), None)
+    
+    if position:
+        embed.add_field(
+            name="🏅 Rank",
+            value=f"#{position} out of {len(leaderboard)} players",
+            inline=False
+        )
+    
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@bot.tree.command(name="unpick", description="Delete your prediction for a match")
+async def unpick_command(interaction: discord.Interaction, match_id: str):
+    user_id = str(interaction.user.id)
+    
+    # Check if match exists and hasn't started
+    match_info = get_match_info(match_id)
+    if not match_info:
+        await interaction.response.send_message("Match not found!", ephemeral=True)
+        return
+    
+    # Check if match has started
+    match_time = match_info['match_time']
+    if match_time.tzinfo is None:
+        match_time = match_time.replace(tzinfo=timezone.utc)
+    
+    if datetime.now(timezone.utc) >= match_time:
+        await interaction.response.send_message("Can't delete prediction - match has already started!", ephemeral=True)
+        return
+    
+    # Check if user has prediction
+    prediction = get_user_prediction(user_id, match_id)
+    if not prediction:
+        await interaction.response.send_message("You haven't made a prediction for this match!", ephemeral=True)
+        return
+    
+    # Delete prediction
+    if delete_prediction(user_id, match_id):
+        # Update live predictions embed
+        live_msg_id = get_live_predictions_message_id(match_id)
+        if live_msg_id:
+            try:
+                channel = bot.get_channel(MATCH_CHANNEL_ID)
+                live_message = await channel.fetch_message(live_msg_id)
+                embed = create_live_predictions_embed(match_id, match_info['home_team'], match_info['away_team'])
+                await live_message.edit(embed=embed)
+            except Exception as e:
+                print(f"Failed to update live predictions: {e}")
+        
+        await interaction.response.send_message(
+            f"Deleted your **{prediction.capitalize()}** prediction for {match_info['home_team']} vs {match_info['away_team']}",
+            ephemeral=True
+        )
+    else:
+        await interaction.response.send_message("Failed to delete prediction. Try again!", ephemeral=True)
+
+@bot.tree.command(name="compare", description="Compare stats with another user")
+async def compare_command(interaction: discord.Interaction, user: discord.Member):
+    user1_id = str(interaction.user.id)
+    user2_id = str(user.id)
+    
+    user1_data = get_user(user1_id)
+    user2_data = get_user(user2_id)
+    
+    if not user1_data:
+        await interaction.response.send_message("You haven't made any predictions yet!", ephemeral=True)
+        return
+    
+    if not user2_data:
+        await interaction.response.send_message(f"{user.name} hasn't made any predictions yet!", ephemeral=True)
+        return
+    
+    stats1 = get_user_stats(user1_id)
+    stats2 = get_user_stats(user2_id)
+    
+    embed = discord.Embed(
+        title=f"⚔️ {interaction.user.name} vs {user.name}",
+        color=discord.Color.purple()
+    )
+    
+    # Points comparison
+    points_diff = user1_data['points'] - user2_data['points']
+    if points_diff > 0:
+        points_text = f"**{interaction.user.name}** leads by {points_diff} pts"
+    elif points_diff < 0:
+        points_text = f"**{user.name}** leads by {abs(points_diff)} pts"
+    else:
+        points_text = "**Tied!**"
+    
+    embed.add_field(
+        name="🏆 Points",
+        value=f"{interaction.user.name}: {user1_data['points']}\n"
+              f"{user.name}: {user2_data['points']}\n"
+              f"{points_text}",
+        inline=False
+    )
+    
+    # Accuracy comparison
+    embed.add_field(
+        name="🎯 Accuracy",
+        value=f"{interaction.user.name}: {stats1['accuracy']:.1f}% ({stats1['correct']}/{stats1['total']})\n"
+              f"{user.name}: {stats2['accuracy']:.1f}% ({stats2['correct']}/{stats2['total']})",
+        inline=False
+    )
+    
+    # Head to head on same matches
+    with db_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT 
+                p1.match_id,
+                p1.prediction as user1_pred,
+                p2.prediction as user2_pred,
+                pm.home_team,
+                pm.away_team,
+                pm.home_score,
+                pm.away_score,
+                pm.status
+            FROM predictions p1
+            INNER JOIN predictions p2 ON p1.match_id = p2.match_id
+            LEFT JOIN posted_matches pm ON p1.match_id = pm.match_id
+            WHERE p1.user_id = %s AND p2.user_id = %s
+            AND pm.status = 'FINISHED' AND pm.home_score IS NOT NULL
+            ORDER BY pm.match_time DESC
+            LIMIT 5
+        """, (user1_id, user2_id))
+        head_to_head = cur.fetchall()
+    
+    if head_to_head:
+        h2h_text = []
+        user1_wins = 0
+        user2_wins = 0
+        
+        for match in head_to_head:
+            # Determine actual result
+            if match['home_score'] > match['away_score']:
+                actual = 'home'
+            elif match['away_score'] > match['home_score']:
+                actual = 'away'
+            else:
+                actual = 'draw'
+            
+            user1_correct = match['user1_pred'] == actual
+            user2_correct = match['user2_pred'] == actual
+            
+            if user1_correct and not user2_correct:
+                user1_wins += 1
+                result = f"✅ {interaction.user.name}"
+            elif user2_correct and not user1_correct:
+                user2_wins += 1
+                result = f"✅ {user.name}"
+            elif user1_correct and user2_correct:
+                result = "🤝 Both"
+            else:
+                result = "❌ Neither"
+            
+            h2h_text.append(f"{match['home_team']} {match['home_score']}-{match['away_score']} {match['away_team']}: {result}")
+        
+        embed.add_field(
+            name=f"🥊 Head-to-Head (Last 5 Shared Matches)",
+            value=f"**{interaction.user.name} wins:** {user1_wins}\n"
+                  f"**{user.name} wins:** {user2_wins}\n\n"
+                  + "\n".join(h2h_text[:3]),  # Show top 3
+            inline=False
+        )
+    
+    await interaction.response.send_message(embed=embed)
+async def ticket_command(interaction: discord.Interaction, user: discord.Member = None):
+    await interaction.response.defer(ephemeral=True)
+    
+    target_user = user or interaction.user
+    user_id = str(target_user.id)
+    
+    user_data = get_user(user_id)
+    if not user_data:
+        await interaction.followup.send(f"{target_user.name} has no predictions yet.", ephemeral=True)
+        return
+    
+    stats = get_user_stats(user_id)
+    
+    # Get all user predictions with match info
+    with db_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT p.match_id, p.prediction, pm.home_team, pm.away_team, pm.match_time,
+                   pm.home_score, pm.away_score, pm.status,
+                   CASE WHEN proc.match_id IS NOT NULL THEN TRUE ELSE FALSE END as is_processed
+            FROM predictions p
+            LEFT JOIN posted_matches pm ON p.match_id = pm.match_id
+            LEFT JOIN processed_matches proc ON p.match_id = proc.match_id
+            WHERE p.user_id = %s
+            ORDER BY pm.match_time DESC NULLS LAST
+        """, (user_id,))
+        predictions = cur.fetchall()
+    
+    if not predictions:
+        await interaction.followup.send(f"{target_user.name} has no predictions yet.", ephemeral=True)
+        return
+    
+    # Use cached results if available, otherwise fetch fresh
+    global cache_timestamp
+    if not cache_timestamp or (datetime.now(timezone.utc) - cache_timestamp) > timedelta(minutes=10):
+        await fetch_all_match_results()
+    
+    embeds = []
+    upcoming_embed = discord.Embed(
+        title=f"🎫 {target_user.name}'s Predictions",
+        description=f"**Points:** {user_data['points']} | **Accuracy:** {stats['accuracy']:.1f}% ({stats['correct']}/{stats['total']})",
+        color=discord.Color.blue()
+    )
+    
+    finished_embed = discord.Embed(
+        title=f"🏆 Finished Matches",
+        description=f"Recent completed predictions",
+        color=discord.Color.gold()
+    )
+    
+    upcoming_count = 0
+    finished_count = 0
+    now = datetime.now(timezone.utc)
+    two_days_ago = now - timedelta(days=2)
+    
+    for pred in predictions:
+        # Only show recent matches
+        if pred['match_time']:
+            match_time = pred['match_time']
+            if match_time.tzinfo is None:
+                match_time = match_time.replace(tzinfo=timezone.utc)
+            if match_time < two_days_ago:
+                continue
+        
+        # Determine if prediction was correct
+        result_icon = ""
+        if pred['status'] == 'FINISHED' and pred['home_score'] is not None:
+            # Determine actual result
+            if pred['home_score'] > pred['away_score']:
+                actual_result = 'home'
+            elif pred['away_score'] > pred['home_score']:
+                actual_result = 'away'
+            else:
+                actual_result = 'draw'
+            
+            if actual_result == pred['prediction']:
+                result_icon = " ✅"
+            else:
+                result_icon = " ❌"
+        
+        # Format field
+        if not pred['home_team']:
+            field_name = f"Match {pred['match_id']}"
+            field_value = f"**Prediction:** {pred['prediction'].capitalize()}{result_icon}"
+            is_finished = pred['is_processed']
+        else:
+            match_time = pred['match_time']
+            if match_time.tzinfo is None:
+                match_time = match_time.replace(tzinfo=timezone.utc)
+            is_future = match_time > now if match_time else False
+            
+            if pred['status'] == 'FINISHED' and pred['home_score'] is not None:
+                status_icon = "✅" if result_icon == " ✅" else "❌"
+                field_name = f"{status_icon} {pred['home_team']} {pred['home_score']}-{pred['away_score']} {pred['away_team']}"
+                field_value = f"**Prediction:** {pred['prediction'].capitalize()}{result_icon}"
+                is_finished = True
+            elif is_future:
+                status_icon = "🔮"
+                field_name = f"{status_icon} {pred['home_team']} vs {pred['away_team']}"
+                field_value = f"**Prediction:** {pred['prediction'].capitalize()}\n**Status:** Upcoming"
+                is_finished = False
+            else:
+                status_icon = "⏳"
+                field_name = f"{status_icon} {pred['home_team']} vs {pred['away_team']}"
+                field_value = f"**Prediction:** {pred['prediction'].capitalize()}\n**Status:** In Progress"
+                is_finished = False
+        
+        # Add to appropriate embed
+        if is_finished:
+            if finished_count >= 20:
+                embeds.append(finished_embed)
+                finished_embed = discord.Embed(
+                    title=f"🏆 Finished Matches (cont.)",
+                    color=discord.Color.gold()
+                )
+                finished_count = 0
+            finished_embed.add_field(name=field_name, value=field_value, inline=False)
+            finished_count += 1
+        else:
+            if upcoming_count >= 20:
+                embeds.append(upcoming_embed)
+                upcoming_embed = discord.Embed(
+                    title=f"🎫 {target_user.name}'s Predictions (cont.)",
+                    color=discord.Color.blue()
+                )
+                upcoming_count = 0
+            upcoming_embed.add_field(name=field_name, value=field_value, inline=False)
+            upcoming_count += 1
+    
+    # Add embeds with content
+    if upcoming_count > 0:
+        embeds.insert(0, upcoming_embed)
+    if finished_count > 0:
+        embeds.append(finished_embed)
+    
+    if not embeds:
+        await interaction.followup.send(f"{target_user.name} has no recent predictions to display.", ephemeral=True)
+        return
+    
+    await interaction.followup.send(embed=embeds[0], ephemeral=True)
+    for embed in embeds[1:]:
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
 # ==== STARTUP ====
 @bot.event
 async def on_ready():
     init_db()
     await bot.tree.sync()
     update_match_results.start()
+    send_match_notifications.start()
+    weekly_recap.start()
     scheduler.start()
     print(f"Logged in as {bot.user}")
 
