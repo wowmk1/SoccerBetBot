@@ -73,6 +73,13 @@ def init_db():
         )
     """)
     
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS processed_matches (
+            match_id TEXT PRIMARY KEY,
+            processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    
     conn.commit()
     cur.close()
     conn.close()
@@ -250,11 +257,21 @@ def get_vote_message_id(match_id):
     conn.close()
     return result
 
-def disable_vote_buttons(match_id):
-    """Mark buttons as disabled"""
+def is_match_processed(match_id):
+    """Check if match results were already processed"""
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("UPDATE vote_data SET buttons_disabled = TRUE WHERE match_id = %s", (match_id,))
+    cur.execute("SELECT 1 FROM processed_matches WHERE match_id = %s", (match_id,))
+    result = cur.fetchone()
+    cur.close()
+    conn.close()
+    return result is not None
+
+def mark_match_processed(match_id):
+    """Mark match as processed"""
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("INSERT INTO processed_matches (match_id) VALUES (%s) ON CONFLICT DO NOTHING", (match_id,))
     conn.commit()
     cur.close()
     conn.close()
@@ -428,6 +445,11 @@ async def update_match_results():
                     status = m.get("status")
                     if status != "FINISHED":
                         continue
+                    
+                    # Skip if already processed
+                    if is_match_processed(match_id):
+                        continue
+                    
                     result = m.get("score", {}).get("winner")
                     if not result:
                         continue
@@ -446,6 +468,9 @@ async def update_match_results():
                     for winner in winners:
                         add_points(winner['user_id'], 1)
                         leaderboard_changed = True
+                    
+                    # Mark match as processed
+                    mark_match_processed(match_id)
                     
                     cur.close()
                     conn.close()
