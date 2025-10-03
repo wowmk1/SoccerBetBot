@@ -604,6 +604,34 @@ async def restore_command(interaction: discord.Interaction, backup_file: discord
     except Exception as e:
         await interaction.followup.send(f"Error restoring data: {str(e)}", ephemeral=True)
 
+@bot.tree.command(name="fixpoints", description="[ADMIN] Mark old matches as processed")
+async def fixpoints_command(interaction: discord.Interaction):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("Admin only", ephemeral=True)
+        return
+    
+    await interaction.response.defer(ephemeral=True)
+    
+    # Get all unique match IDs from predictions
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT DISTINCT match_id FROM predictions")
+    match_ids = [row['match_id'] for row in cur.fetchall()]
+    
+    # Mark them all as processed
+    for match_id in match_ids:
+        cur.execute("""
+            INSERT INTO processed_matches (match_id)
+            VALUES (%s)
+            ON CONFLICT DO NOTHING
+        """, (match_id,))
+    
+    conn.commit()
+    cur.close()
+    conn.close()
+    
+    await interaction.followup.send(f"Marked {len(match_ids)} matches as processed. Points won't be re-awarded.", ephemeral=True)
+
 # ==== USER COMMANDS ====
 @bot.tree.command(name="matches", description="Show upcoming matches")
 async def matches_command(interaction: discord.Interaction):
