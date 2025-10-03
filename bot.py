@@ -809,12 +809,14 @@ async def leaderboard_command(interaction: discord.Interaction):
 
 @bot.tree.command(name="ticket", description="Show your predictions")
 async def ticket_command(interaction: discord.Interaction, user: discord.Member = None):
+    await interaction.response.defer(ephemeral=True)
+    
     target_user = user or interaction.user
     user_id = str(target_user.id)
     
     user_data = get_user(user_id)
     if not user_data:
-        await interaction.response.send_message(f"{target_user.name} has no predictions yet.", ephemeral=True)
+        await interaction.followup.send(f"{target_user.name} has no predictions yet.", ephemeral=True)
         return
     
     stats = get_user_stats(user_id)
@@ -836,7 +838,7 @@ async def ticket_command(interaction: discord.Interaction, user: discord.Member 
     conn.close()
     
     if not predictions:
-        await interaction.response.send_message(f"{target_user.name} has no predictions yet.", ephemeral=True)
+        await interaction.followup.send(f"{target_user.name} has no predictions yet.", ephemeral=True)
         return
     
     # Fetch actual results for processed matches to determine if prediction was correct
