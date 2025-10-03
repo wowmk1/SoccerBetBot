@@ -165,6 +165,15 @@ def update_prediction(user_id, match_id, new_prediction):
         conn.commit()
         return cur.rowcount > 0
 
+def get_user_prediction(user_id, match_id):
+    """Get user's prediction for a match"""
+    with db_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT prediction FROM predictions WHERE user_id = %s AND match_id = %s", 
+                   (user_id, match_id))
+        result = cur.fetchone()
+        return result['prediction'] if result else None
+
 def delete_prediction(user_id, match_id):
     """Delete a prediction"""
     with db_connection() as conn:
