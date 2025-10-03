@@ -684,6 +684,32 @@ async def restore_command(interaction: discord.Interaction, backup_file: discord
     except Exception as e:
         await interaction.followup.send(f"Error restoring data: {str(e)}", ephemeral=True)
 
+@bot.tree.command(name="fixdb", description="[ADMIN] Add missing database columns")
+async def fixdb_command(interaction: discord.Interaction):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("Admin only", ephemeral=True)
+        return
+    
+    await interaction.response.defer(ephemeral=True)
+    
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        
+        # Add live_predictions_msg_id column if it doesn't exist
+        cur.execute("""
+            ALTER TABLE vote_data 
+            ADD COLUMN IF NOT EXISTS live_predictions_msg_id BIGINT
+        """)
+        
+        conn.commit()
+        cur.close()
+        conn.close()
+        
+        await interaction.followup.send("Database schema updated successfully!", ephemeral=True)
+    except Exception as e:
+        await interaction.followup.send(f"Error: {str(e)}", ephemeral=True)
+
 @bot.tree.command(name="forcefetch", description="[ADMIN] Force fetch and post upcoming matches")
 async def forcefetch_command(interaction: discord.Interaction):
     if not interaction.user.guild_permissions.administrator:
