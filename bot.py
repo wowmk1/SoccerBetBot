@@ -953,10 +953,10 @@ async def ticket_command(interaction: discord.Interaction, user: discord.Member 
         embeds.append(finished_embed)
     
     if not embeds:
-        await interaction.response.send_message(f"{target_user.name} has no recent predictions to display.", ephemeral=True)
+        await interaction.followup.send(f"{target_user.name} has no recent predictions to display.", ephemeral=True)
         return
     
-    await interaction.response.send_message(embed=embeds[0], ephemeral=True)
+    await interaction.followup.send(embed=embeds[0], ephemeral=True)
     for embed in embeds[1:]:
         await interaction.followup.send(embed=embed, ephemeral=True)
 
