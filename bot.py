@@ -7,6 +7,7 @@ from psycopg2.extras import RealDictCursor
 from datetime import datetime, timezone, timedelta
 from io import BytesIO, StringIO
 from PIL import Image
+from contextlib import contextmanager
 import discord
 from discord.ext import commands, tasks
 from discord.ui import View, Button
@@ -27,124 +28,125 @@ intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# ==== DATABASE FUNCTIONS ====
-def get_db():
-    return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+# ==== CACHE FOR MATCH RESULTS ====
+match_results_cache = {}
+cache_timestamp = None
 
+# ==== DATABASE CONTEXT MANAGER ====
+@contextmanager
+def db_connection():
+    """Context manager for database connections"""
+    conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+# ==== DATABASE FUNCTIONS ====
 def init_db():
     """Initialize database tables"""
-    conn = get_db()
-    cur = conn.cursor()
-    
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            user_id TEXT PRIMARY KEY,
-            username TEXT NOT NULL,
-            points INTEGER DEFAULT 0
-        )
-    """)
-    
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS predictions (
-            id SERIAL PRIMARY KEY,
-            user_id TEXT NOT NULL,
-            match_id TEXT NOT NULL,
-            prediction TEXT NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(user_id, match_id)
-        )
-    """)
-    
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS posted_matches (
-            match_id TEXT PRIMARY KEY,
-            home_team TEXT,
-            away_team TEXT,
-            match_time TIMESTAMP,
-            posted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS vote_data (
-            match_id TEXT PRIMARY KEY,
-            votes_msg_id BIGINT,
-            live_predictions_msg_id BIGINT,
-            buttons_disabled BOOLEAN DEFAULT FALSE
-        )
-    """)
-    
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS processed_matches (
-            match_id TEXT PRIMARY KEY,
-            processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    
-    conn.commit()
-    cur.close()
-    conn.close()
+    with db_connection() as conn:
+        cur = conn.cursor()
+        
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id TEXT PRIMARY KEY,
+                username TEXT NOT NULL,
+                points INTEGER DEFAULT 0
+            )
+        """)
+        
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS predictions (
+                id SERIAL PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                match_id TEXT NOT NULL,
+                prediction TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(user_id, match_id)
+            )
+        """)
+        
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS posted_matches (
+                match_id TEXT PRIMARY KEY,
+                home_team TEXT,
+                away_team TEXT,
+                match_time TIMESTAMP,
+                competition TEXT,
+                home_score INTEGER,
+                away_score INTEGER,
+                status TEXT DEFAULT 'SCHEDULED',
+                posted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS vote_data (
+                match_id TEXT PRIMARY KEY,
+                votes_msg_id BIGINT,
+                live_predictions_msg_id BIGINT,
+                buttons_disabled BOOLEAN DEFAULT FALSE
+            )
+        """)
+        
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS processed_matches (
+                match_id TEXT PRIMARY KEY,
+                processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
+        conn.commit()
 
 def get_leaderboard():
     """Get all users sorted by points"""
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT user_id, username, points FROM users ORDER BY points DESC, username ASC")
-    results = cur.fetchall()
-    cur.close()
-    conn.close()
-    return results
+    with db_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT user_id, username, points FROM users ORDER BY points DESC, username ASC")
+        return cur.fetchall()
 
 def get_user(user_id):
     """Get user data"""
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM users WHERE user_id = %s", (user_id,))
-    result = cur.fetchone()
-    cur.close()
-    conn.close()
-    return result
+    with db_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM users WHERE user_id = %s", (user_id,))
+        return cur.fetchone()
 
 def upsert_user(user_id, username):
     """Create or update user"""
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO users (user_id, username, points)
-        VALUES (%s, %s, 0)
-        ON CONFLICT (user_id) DO UPDATE SET username = EXCLUDED.username
-    """, (user_id, username))
-    conn.commit()
-    cur.close()
-    conn.close()
+    with db_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO users (user_id, username, points)
+            VALUES (%s, %s, 0)
+            ON CONFLICT (user_id) DO UPDATE SET username = EXCLUDED.username
+        """, (user_id, username))
+        conn.commit()
 
 def add_prediction(user_id, match_id, prediction):
     """Add a prediction"""
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO predictions (user_id, match_id, prediction)
-        VALUES (%s, %s, %s)
-        ON CONFLICT (user_id, match_id) DO NOTHING
-    """, (user_id, match_id, prediction))
-    conn.commit()
-    cur.close()
-    conn.close()
+    with db_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO predictions (user_id, match_id, prediction)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (user_id, match_id) DO NOTHING
+        """, (user_id, match_id, prediction))
+        conn.commit()
 
 def get_predictions_for_match(match_id):
     """Get all predictions for a match grouped by prediction type"""
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT p.prediction, u.username
-        FROM predictions p
-        JOIN users u ON p.user_id = u.user_id
-        WHERE p.match_id = %s
-        ORDER BY u.username
-    """, (match_id,))
-    results = cur.fetchall()
-    cur.close()
-    conn.close()
+    with db_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT p.prediction, u.username
+            FROM predictions p
+            JOIN users u ON p.user_id = u.user_id
+            WHERE p.match_id = %s
+            ORDER BY u.username
+        """, (match_id,))
+        results = cur.fetchall()
     
     votes = {"home": set(), "draw": set(), "away": set()}
     for row in results:
@@ -153,152 +155,135 @@ def get_predictions_for_match(match_id):
 
 def get_user_stats(user_id):
     """Get user prediction stats"""
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT COUNT(*) as total FROM predictions WHERE user_id = %s", (user_id,))
-    total = cur.fetchone()['total']
-    
-    cur.execute("SELECT points FROM users WHERE user_id = %s", (user_id,))
-    user = cur.fetchone()
-    correct = user['points'] if user else 0
-    
-    cur.close()
-    conn.close()
+    with db_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) as total FROM predictions WHERE user_id = %s", (user_id,))
+        total = cur.fetchone()['total']
+        
+        cur.execute("SELECT points FROM users WHERE user_id = %s", (user_id,))
+        user = cur.fetchone()
+        correct = user['points'] if user else 0
     
     accuracy = (correct / total * 100) if total > 0 else 0
     return {"total": total, "correct": correct, "accuracy": accuracy}
 
 def user_has_prediction(user_id, match_id):
     """Check if user already voted"""
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT 1 FROM predictions WHERE user_id = %s AND match_id = %s", (user_id, match_id))
-    result = cur.fetchone()
-    cur.close()
-    conn.close()
-    return result is not None
+    with db_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT 1 FROM predictions WHERE user_id = %s AND match_id = %s", (user_id, match_id))
+        return cur.fetchone() is not None
 
 def add_points(user_id, points_to_add):
     """Add points to user"""
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("UPDATE users SET points = points + %s WHERE user_id = %s", (points_to_add, user_id))
-    conn.commit()
-    cur.close()
-    conn.close()
+    with db_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("UPDATE users SET points = points + %s WHERE user_id = %s", (points_to_add, user_id))
+        conn.commit()
 
 def set_user_points(user_id, points):
     """Set user points to specific value"""
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("UPDATE users SET points = %s WHERE user_id = %s", (points, user_id))
-    conn.commit()
-    cur.close()
-    conn.close()
+    with db_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("UPDATE users SET points = %s WHERE user_id = %s", (points, user_id))
+        conn.commit()
 
 def is_match_posted(match_id):
     """Check if match already posted"""
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT 1 FROM posted_matches WHERE match_id = %s", (match_id,))
-    result = cur.fetchone()
-    cur.close()
-    conn.close()
-    return result is not None
+    with db_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT 1 FROM posted_matches WHERE match_id = %s", (match_id,))
+        return cur.fetchone() is not None
 
-def mark_match_posted(match_id, home_team, away_team, match_time):
+def mark_match_posted(match_id, home_team, away_team, match_time, competition):
     """Mark match as posted"""
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO posted_matches (match_id, home_team, away_team, match_time)
-        VALUES (%s, %s, %s, %s)
-        ON CONFLICT DO NOTHING
-    """, (match_id, home_team, away_team, match_time))
-    conn.commit()
-    cur.close()
-    conn.close()
+    with db_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO posted_matches (match_id, home_team, away_team, match_time, competition)
+            VALUES (%s, %s, %s, %s, %s)
+            ON CONFLICT DO NOTHING
+        """, (match_id, home_team, away_team, match_time, competition))
+        conn.commit()
 
-def get_recent_matches():
-    """Get matches from last 2 days and upcoming"""
-    conn = get_db()
-    cur = conn.cursor()
-    two_days_ago = datetime.now(timezone.utc) - timedelta(days=2)
-    cur.execute("""
-        SELECT match_id, home_team, away_team, match_time
-        FROM posted_matches
-        WHERE match_time >= %s
-        ORDER BY match_time ASC
-    """, (two_days_ago,))
-    results = cur.fetchall()
-    cur.close()
-    conn.close()
-    return results
+def update_match_score(match_id, home_score, away_score, status):
+    """Update match score and status"""
+    with db_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE posted_matches
+            SET home_score = %s, away_score = %s, status = %s
+            WHERE match_id = %s
+        """, (home_score, away_score, status, match_id))
+        conn.commit()
+
+def get_match_info(match_id):
+    """Get match information including scores"""
+    with db_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT home_team, away_team, home_score, away_score, status, competition
+            FROM posted_matches WHERE match_id = %s
+        """, (match_id,))
+        return cur.fetchone()
 
 def save_vote_message(match_id, msg_id):
     """Save vote message ID"""
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO vote_data (match_id, votes_msg_id)
-        VALUES (%s, %s)
-        ON CONFLICT (match_id) DO UPDATE SET votes_msg_id = EXCLUDED.votes_msg_id
-    """, (match_id, msg_id))
-    conn.commit()
-    cur.close()
-    conn.close()
+    with db_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO vote_data (match_id, votes_msg_id)
+            VALUES (%s, %s)
+            ON CONFLICT (match_id) DO UPDATE SET votes_msg_id = EXCLUDED.votes_msg_id
+        """, (match_id, msg_id))
+        conn.commit()
 
 def save_live_predictions_message(match_id, msg_id):
     """Save live predictions message ID"""
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("""
-        UPDATE vote_data
-        SET live_predictions_msg_id = %s
-        WHERE match_id = %s
-    """, (msg_id, match_id))
-    conn.commit()
-    cur.close()
-    conn.close()
+    with db_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE vote_data
+            SET live_predictions_msg_id = %s
+            WHERE match_id = %s
+        """, (msg_id, match_id))
+        conn.commit()
 
 def get_live_predictions_message_id(match_id):
     """Get live predictions message ID"""
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT live_predictions_msg_id FROM vote_data WHERE match_id = %s", (match_id,))
-    result = cur.fetchone()
-    cur.close()
-    conn.close()
-    return result['live_predictions_msg_id'] if result else None
+    with db_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT live_predictions_msg_id FROM vote_data WHERE match_id = %s", (match_id,))
+        result = cur.fetchone()
+        return result['live_predictions_msg_id'] if result else None
 
 def get_vote_message_id(match_id):
     """Get vote message ID"""
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT votes_msg_id, buttons_disabled FROM vote_data WHERE match_id = %s", (match_id,))
-    result = cur.fetchone()
-    cur.close()
-    conn.close()
-    return result
+    with db_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT votes_msg_id, buttons_disabled FROM vote_data WHERE match_id = %s", (match_id,))
+        return cur.fetchone()
+
+def disable_vote_buttons(match_id):
+    """Mark vote buttons as disabled"""
+    with db_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("UPDATE vote_data SET buttons_disabled = TRUE WHERE match_id = %s", (match_id,))
+        conn.commit()
 
 def is_match_processed(match_id):
     """Check if match results were already processed"""
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT 1 FROM processed_matches WHERE match_id = %s", (match_id,))
-    result = cur.fetchone()
-    cur.close()
-    conn.close()
-    return result is not None
+    with db_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT 1 FROM processed_matches WHERE match_id = %s", (match_id,))
+        return cur.fetchone() is not None
 
 def mark_match_processed(match_id):
     """Mark match as processed"""
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("INSERT INTO processed_matches (match_id) VALUES (%s) ON CONFLICT DO NOTHING", (match_id,))
-    conn.commit()
-    cur.close()
-    conn.close()
+    with db_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("INSERT INTO processed_matches (match_id) VALUES (%s) ON CONFLICT DO NOTHING", (match_id,))
+        conn.commit()
 
 # ==== FOOTBALL API ====
 BASE_URL = "https://api.football-data.org/v4/competitions/"
@@ -308,10 +293,9 @@ COMPETITIONS = ["PL", "CL", "BL1", "PD", "FL1", "SA"]
 last_leaderboard_msg_id = None
 
 # ==== VOTES EMBED CREATION ====
-def create_live_predictions_embed(match_id, home_team, away_team):
+def create_live_predictions_embed(match_id, home_team, away_team, match_info=None):
     """Create live predictions embed showing vote breakdown"""
     votes = get_predictions_for_match(match_id)
-    
     total_votes = len(votes['home']) + len(votes['draw']) + len(votes['away'])
     
     if total_votes == 0:
@@ -321,14 +305,18 @@ def create_live_predictions_embed(match_id, home_team, away_team):
         draw_pct = (len(votes['draw']) / total_votes) * 100
         away_pct = (len(votes['away']) / total_votes) * 100
     
-    embed = discord.Embed(
-        title="📊 Live Predictions",
-        description=f"**{home_team} vs {away_team}**\n🔮 {total_votes} predictions so far",
-        color=discord.Color.green()
-    )
+    # Check if match is finished and show score
+    title = "📊 Live Predictions"
+    description = f"**{home_team} vs {away_team}**\n🔮 {total_votes} predictions so far"
+    
+    if match_info and match_info['status'] == 'FINISHED' and match_info['home_score'] is not None:
+        title = "🏆 Final Result"
+        description = f"**{home_team} {match_info['home_score']} - {match_info['away_score']} {away_team}**\n🔮 {total_votes} predictions made"
+    
+    embed = discord.Embed(title=title, description=description, color=discord.Color.green())
     
     # Home predictions
-    home_users = ", ".join(sorted(votes['home'])) if votes['home'] else "No predictions yet"
+    home_users = ", ".join(sorted(votes['home'])) if votes['home'] else "No predictions"
     embed.add_field(
         name=f"🏠 {home_team} ({len(votes['home'])})",
         value=home_users,
@@ -336,7 +324,7 @@ def create_live_predictions_embed(match_id, home_team, away_team):
     )
     
     # Draw predictions
-    draw_users = ", ".join(sorted(votes['draw'])) if votes['draw'] else "No predictions yet"
+    draw_users = ", ".join(sorted(votes['draw'])) if votes['draw'] else "No predictions"
     embed.add_field(
         name=f"🤝 Draw ({len(votes['draw'])})",
         value=draw_users,
@@ -344,7 +332,7 @@ def create_live_predictions_embed(match_id, home_team, away_team):
     )
     
     # Away predictions
-    away_users = ", ".join(sorted(votes['away'])) if votes['away'] else "No predictions yet"
+    away_users = ", ".join(sorted(votes['away'])) if votes['away'] else "No predictions"
     embed.add_field(
         name=f"✈️ {away_team} ({len(votes['away'])})",
         value=away_users,
@@ -366,14 +354,16 @@ async def generate_match_image(home_url, away_url):
         home_img_bytes, away_img_bytes = None, None
         try:
             if home_url:
-                async with session.get(home_url) as r:
+                async with session.get(home_url, timeout=aiohttp.ClientTimeout(total=5)) as r:
                     home_img_bytes = await r.read()
-        except: pass
+        except Exception as e:
+            print(f"Failed to fetch home crest: {e}")
         try:
             if away_url:
-                async with session.get(away_url) as r:
+                async with session.get(away_url, timeout=aiohttp.ClientTimeout(total=5)) as r:
                     away_img_bytes = await r.read()
-        except: pass
+        except Exception as e:
+            print(f"Failed to fetch away crest: {e}")
 
     size = (100, 100)
     padding = 40
@@ -381,31 +371,79 @@ async def generate_match_image(home_url, away_url):
     height = size[1]
     img = Image.new("RGBA", (width, height), (255, 255, 255, 0))
     if home_img_bytes:
-        home = Image.open(BytesIO(home_img_bytes)).convert("RGBA").resize(size)
-        img.paste(home, (0, 0), home)
+        try:
+            home = Image.open(BytesIO(home_img_bytes)).convert("RGBA").resize(size)
+            img.paste(home, (0, 0), home)
+        except Exception as e:
+            print(f"Failed to process home crest image: {e}")
     if away_img_bytes:
-        away = Image.open(BytesIO(away_img_bytes)).convert("RGBA").resize(size)
-        img.paste(away, (size[0]+padding, 0), away)
+        try:
+            away = Image.open(BytesIO(away_img_bytes)).convert("RGBA").resize(size)
+            img.paste(away, (size[0]+padding, 0), away)
+        except Exception as e:
+            print(f"Failed to process away crest image: {e}")
     buffer = BytesIO()
     img.save(buffer, format="PNG")
     buffer.seek(0)
     return buffer
 
 # ==== FETCH MATCHES ====
-async def fetch_matches():
+async def fetch_matches(hours=24):
+    """Fetch matches within specified hours window"""
     now = datetime.now(timezone.utc)
-    next_24h = now + timedelta(hours=24)
+    future = now + timedelta(hours=hours)
     matches = []
+    
     async with aiohttp.ClientSession() as session:
         for comp in COMPETITIONS:
-            url = f"{BASE_URL}{comp}/matches?dateFrom={now.date()}&dateTo={next_24h.date()}"
-            async with session.get(url, headers=HEADERS) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    for m in data.get("matches", []):
-                        m["competition"]["name"] = data.get("competition", {}).get("name", comp)
-                        matches.append(m)
-    return [m for m in matches if now <= datetime.fromisoformat(m['utcDate'].replace("Z", "+00:00")) <= next_24h]
+            url = f"{BASE_URL}{comp}/matches?dateFrom={now.date()}&dateTo={future.date()}"
+            try:
+                async with session.get(url, headers=HEADERS, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        comp_name = data.get("competition", {}).get("name", comp)
+                        for m in data.get("matches", []):
+                            m["competition"]["name"] = comp_name
+                            matches.append(m)
+                    else:
+                        print(f"Failed to fetch {comp}: {resp.status}")
+            except Exception as e:
+                print(f"Error fetching {comp}: {e}")
+    
+    return [m for m in matches if now <= datetime.fromisoformat(m['utcDate'].replace("Z", "+00:00")) <= future]
+
+async def fetch_all_match_results():
+    """Fetch all match results and cache them"""
+    global match_results_cache, cache_timestamp
+    
+    results = {}
+    async with aiohttp.ClientSession() as session:
+        for comp in COMPETITIONS:
+            url = f"{BASE_URL}{comp}/matches"
+            try:
+                async with session.get(url, headers=HEADERS, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        for m in data.get("matches", []):
+                            if m.get("status") == "FINISHED":
+                                match_id = str(m["id"])
+                                winner = m.get("score", {}).get("winner")
+                                home_score = m.get("score", {}).get("fullTime", {}).get("home")
+                                away_score = m.get("score", {}).get("fullTime", {}).get("away")
+                                
+                                if winner:
+                                    result_map = {"HOME_TEAM": "home", "AWAY_TEAM": "away", "DRAW": "draw"}
+                                    results[match_id] = {
+                                        "result": result_map.get(winner, winner.lower()),
+                                        "home_score": home_score,
+                                        "away_score": away_score
+                                    }
+            except Exception as e:
+                print(f"Error fetching results for {comp}: {e}")
+    
+    match_results_cache = results
+    cache_timestamp = datetime.now(timezone.utc)
+    return results
 
 # ==== VOTE BUTTON ====
 class VoteButton(Button):
@@ -433,12 +471,7 @@ class VoteButton(Button):
         add_prediction(user_id, match_id, self.category)
         
         # Get match info for live predictions
-        conn = get_db()
-        cur = conn.cursor()
-        cur.execute("SELECT home_team, away_team FROM posted_matches WHERE match_id = %s", (match_id,))
-        match_data = cur.fetchone()
-        cur.close()
-        conn.close()
+        match_data = get_match_info(match_id)
         
         # Update live predictions embed
         if match_data:
@@ -466,14 +499,16 @@ async def post_match(match):
     kickoff_ts = int(match_time.timestamp())
     channel = bot.get_channel(MATCH_CHANNEL_ID)
     if not channel:
+        print(f"Channel {MATCH_CHANNEL_ID} not found")
         return
     
     home_team = match['homeTeam']['name']
     away_team = match['awayTeam']['name']
+    competition = match['competition'].get('name', 'Unknown')
     
     embed = discord.Embed(
         title=f"{home_team} vs {away_team}",
-        description=f"Kickoff: <t:{kickoff_ts}:f>",
+        description=f"**{competition}**\nKickoff: <t:{kickoff_ts}:f>",
         color=discord.Color.blue()
     )
     
@@ -481,24 +516,30 @@ async def post_match(match):
     away_crest = match["awayTeam"].get("crest")
     file = None
     if home_crest or away_crest:
-        image_buffer = await generate_match_image(home_crest, away_crest)
-        file = discord.File(fp=image_buffer, filename="match.png")
-        embed.set_image(url="attachment://match.png")
+        try:
+            image_buffer = await generate_match_image(home_crest, away_crest)
+            file = discord.File(fp=image_buffer, filename="match.png")
+            embed.set_image(url="attachment://match.png")
+        except Exception as e:
+            print(f"Failed to generate match image: {e}")
     
     view = View()
     view.add_item(VoteButton("Home", "home", match_id, kickoff_time=match_time))
     view.add_item(VoteButton("Draw", "draw", match_id, kickoff_time=match_time))
     view.add_item(VoteButton("Away", "away", match_id, kickoff_time=match_time))
     
-    match_message = await channel.send(embed=embed, file=file, view=view)
-    save_vote_message(match_id, match_message.id)
-    
-    # Post live predictions embed below
-    live_embed = create_live_predictions_embed(match_id, home_team, away_team)
-    live_message = await channel.send(embed=live_embed)
-    save_live_predictions_message(match_id, live_message.id)
-    
-    mark_match_posted(match_id, home_team, away_team, match_time)
+    try:
+        match_message = await channel.send(embed=embed, file=file, view=view)
+        save_vote_message(match_id, match_message.id)
+        
+        # Post live predictions embed below
+        live_embed = create_live_predictions_embed(match_id, home_team, away_team)
+        live_message = await channel.send(embed=live_embed)
+        save_live_predictions_message(match_id, live_message.id)
+        
+        mark_match_posted(match_id, home_team, away_team, match_time, competition)
+    except Exception as e:
+        print(f"Failed to post match {match_id}: {e}")
 
 # ==== UPDATE MATCH RESULTS ====
 @tasks.loop(minutes=5)
@@ -506,69 +547,73 @@ async def update_match_results():
     global last_leaderboard_msg_id
     leaderboard_changed = False
     
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT user_id, points FROM users")
-    previous_points = {row['user_id']: row['points'] for row in cur.fetchall()}
-    cur.close()
-    conn.close()
+    with db_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT user_id, points FROM users")
+        previous_points = {row['user_id']: row['points'] for row in cur.fetchall()}
     
-    async with aiohttp.ClientSession() as session:
-        for comp in COMPETITIONS:
-            url = f"{BASE_URL}{comp}/matches"
-            async with session.get(url, headers=HEADERS) as resp:
-                if resp.status != 200:
-                    continue
-                data = await resp.json()
-                for m in data.get("matches", []):
-                    match_id = str(m["id"])
-                    status = m.get("status")
-                    if status != "FINISHED":
-                        continue
-                    
-                    # Skip if already processed
-                    if is_match_processed(match_id):
-                        continue
-                    
-                    result = m.get("score", {}).get("winner")
-                    if not result:
-                        continue
-                    
-                    result_map = {"HOME_TEAM": "home", "AWAY_TEAM": "away", "DRAW": "draw"}
-                    result = result_map.get(result, result.lower())
-                    
-                    conn = get_db()
-                    cur = conn.cursor()
-                    cur.execute("""
-                        SELECT user_id FROM predictions
-                        WHERE match_id = %s AND prediction = %s
-                    """, (match_id, result))
-                    winners = cur.fetchall()
-                    
-                    for winner in winners:
-                        add_points(winner['user_id'], 1)
-                        leaderboard_changed = True
-                    
-                    # Mark match as processed
-                    mark_match_processed(match_id)
-                    
-                    cur.close()
-                    conn.close()
-                    
-                    vote_msg = get_vote_message_id(match_id)
-                    if vote_msg and not vote_msg['buttons_disabled']:
-                        try:
-                            channel = bot.get_channel(MATCH_CHANNEL_ID)
-                            votes_message = await channel.fetch_message(vote_msg['votes_msg_id'])
-                            embed = create_votes_embed(match_id, match_result=result)
-                            new_view = View()
-                            for item in votes_message.components[0].children:
-                                item.disabled = True
-                                new_view.add_item(item)
-                            await votes_message.edit(embed=embed, view=new_view)
-                            disable_vote_buttons(match_id)
-                        except Exception as e:
-                            print(f"Failed to update votes: {e}")
+    # Fetch fresh results
+    results = await fetch_all_match_results()
+    
+    for match_id, result_data in results.items():
+        # Skip if already processed
+        if is_match_processed(match_id):
+            continue
+        
+        result = result_data['result']
+        home_score = result_data.get('home_score')
+        away_score = result_data.get('away_score')
+        
+        # Update match score in database
+        if home_score is not None and away_score is not None:
+            update_match_score(match_id, home_score, away_score, 'FINISHED')
+        
+        # Award points
+        with db_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT user_id FROM predictions
+                WHERE match_id = %s AND prediction = %s
+            """, (match_id, result))
+            winners = cur.fetchall()
+        
+        for winner in winners:
+            add_points(winner['user_id'], 1)
+            leaderboard_changed = True
+        
+        # Mark match as processed
+        mark_match_processed(match_id)
+        
+        # Update vote message to show result
+        vote_msg = get_vote_message_id(match_id)
+        if vote_msg and not vote_msg['buttons_disabled']:
+            try:
+                channel = bot.get_channel(MATCH_CHANNEL_ID)
+                votes_message = await channel.fetch_message(vote_msg['votes_msg_id'])
+                
+                # Disable buttons
+                new_view = View()
+                for item in votes_message.components[0].children:
+                    item.disabled = True
+                    new_view.add_item(item)
+                await votes_message.edit(view=new_view)
+                disable_vote_buttons(match_id)
+            except Exception as e:
+                print(f"Failed to update vote buttons for {match_id}: {e}")
+        
+        # Update live predictions to show final score
+        match_info = get_match_info(match_id)
+        if match_info:
+            live_msg_id = get_live_predictions_message_id(match_id)
+            if live_msg_id:
+                try:
+                    channel = bot.get_channel(MATCH_CHANNEL_ID)
+                    live_message = await channel.fetch_message(live_msg_id)
+                    embed = create_live_predictions_embed(match_id, match_info['home_team'], 
+                                                         match_info['away_team'], match_info)
+                    await live_message.edit(embed=embed)
+                except Exception as e:
+                    print(f"Failed to update final score for {match_id}: {e}")
     
     if leaderboard_changed:
         channel = bot.get_channel(LEADERBOARD_CHANNEL_ID)
@@ -591,7 +636,8 @@ async def update_match_results():
             else:
                 msg = await channel.send(embed=embed)
                 last_leaderboard_msg_id = msg.id
-        except:
+        except Exception as e:
+            print(f"Failed to update leaderboard: {e}")
             msg = await channel.send(embed=embed)
             last_leaderboard_msg_id = msg.id
 
@@ -602,17 +648,12 @@ async def backup_command(interaction: discord.Interaction):
         await interaction.response.send_message("Admin only", ephemeral=True)
         return
     
-    conn = get_db()
-    cur = conn.cursor()
-    
-    cur.execute("SELECT user_id, username, points FROM users")
-    users = cur.fetchall()
-    
-    cur.execute("SELECT user_id, match_id, prediction FROM predictions")
-    predictions = cur.fetchall()
-    
-    cur.close()
-    conn.close()
+    with db_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT user_id, username, points FROM users")
+        users = cur.fetchall()
+        cur.execute("SELECT user_id, match_id, prediction FROM predictions")
+        predictions = cur.fetchall()
     
     backup_data = {
         "users": [dict(u) for u in users],
@@ -650,41 +691,7 @@ async def addpoints_command(interaction: discord.Interaction, user: discord.Memb
     current_user = get_user(user_id)
     await interaction.response.send_message(f"Added {points} points to {user.name}. New total: {current_user['points']}", ephemeral=True)
 
-@bot.tree.command(name="restore", description="[ADMIN] Restore from backup JSON")
-async def restore_command(interaction: discord.Interaction, backup_file: discord.Attachment):
-    if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("Admin only", ephemeral=True)
-        return
-    
-    await interaction.response.defer(ephemeral=True)
-    
-    try:
-        content = await backup_file.read()
-        data = json.loads(content.decode('utf-8'))
-        
-        conn = get_db()
-        cur = conn.cursor()
-        
-        for user_id, user_data in data.items():
-            upsert_user(user_id, user_data['name'])
-            set_user_points(user_id, user_data['points'])
-            
-            for match_id, prediction in user_data.get('predictions', {}).items():
-                cur.execute("""
-                    INSERT INTO predictions (user_id, match_id, prediction)
-                    VALUES (%s, %s, %s)
-                    ON CONFLICT (user_id, match_id) DO NOTHING
-                """, (user_id, match_id, prediction))
-        
-        conn.commit()
-        cur.close()
-        conn.close()
-        
-        await interaction.followup.send("Data restored successfully!", ephemeral=True)
-    except Exception as e:
-        await interaction.followup.send(f"Error restoring data: {str(e)}", ephemeral=True)
-
-@bot.tree.command(name="fixdb", description="[ADMIN] Add missing database columns")
+@bot.tree.command(name="fixdb", description="[ADMIN] Update database schema")
 async def fixdb_command(interaction: discord.Interaction):
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("Admin only", ephemeral=True)
@@ -693,18 +700,14 @@ async def fixdb_command(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     
     try:
-        conn = get_db()
-        cur = conn.cursor()
-        
-        # Add live_predictions_msg_id column if it doesn't exist
-        cur.execute("""
-            ALTER TABLE vote_data 
-            ADD COLUMN IF NOT EXISTS live_predictions_msg_id BIGINT
-        """)
-        
-        conn.commit()
-        cur.close()
-        conn.close()
+        with db_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("ALTER TABLE vote_data ADD COLUMN IF NOT EXISTS live_predictions_msg_id BIGINT")
+            cur.execute("ALTER TABLE posted_matches ADD COLUMN IF NOT EXISTS competition TEXT")
+            cur.execute("ALTER TABLE posted_matches ADD COLUMN IF NOT EXISTS home_score INTEGER")
+            cur.execute("ALTER TABLE posted_matches ADD COLUMN IF NOT EXISTS away_score INTEGER")
+            cur.execute("ALTER TABLE posted_matches ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'SCHEDULED'")
+            conn.commit()
         
         await interaction.followup.send("Database schema updated successfully!", ephemeral=True)
     except Exception as e:
@@ -718,24 +721,10 @@ async def forcefetch_command(interaction: discord.Interaction):
     
     await interaction.response.defer(ephemeral=True)
     
-    now = datetime.now(timezone.utc)
-    next_48h = now + timedelta(hours=48)
-    matches = []
-    
-    async with aiohttp.ClientSession() as session:
-        for comp in COMPETITIONS:
-            url = f"{BASE_URL}{comp}/matches?dateFrom={now.date()}&dateTo={next_48h.date()}"
-            async with session.get(url, headers=HEADERS) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    for m in data.get("matches", []):
-                        m["competition"]["name"] = data.get("competition", {}).get("name", comp)
-                        matches.append(m)
-    
-    upcoming = [m for m in matches if now <= datetime.fromisoformat(m['utcDate'].replace("Z", "+00:00")) <= next_48h]
+    upcoming = await fetch_matches(hours=48)
     
     if not upcoming:
-        await interaction.followup.send(f"No matches found in next 48 hours. Total fetched: {len(matches)}", ephemeral=True)
+        await interaction.followup.send(f"No matches found in next 48 hours.", ephemeral=True)
         return
     
     posted_count = 0
@@ -744,8 +733,11 @@ async def forcefetch_command(interaction: discord.Interaction):
         if not is_match_posted(match_id):
             await post_match(match)
             posted_count += 1
+            await asyncio.sleep(1)  # Rate limiting
     
     await interaction.followup.send(f"Found {len(upcoming)} matches. Posted {posted_count} new matches.", ephemeral=True)
+
+@bot.tree.command(name="fixpoints", description="[ADMIN] Mark all existing matches as processed")
 async def fixpoints_command(interaction: discord.Interaction):
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("Admin only", ephemeral=True)
@@ -753,32 +745,30 @@ async def fixpoints_command(interaction: discord.Interaction):
     
     await interaction.response.defer(ephemeral=True)
     
-    # Get all unique match IDs from predictions
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT DISTINCT match_id FROM predictions")
-    match_ids = [row['match_id'] for row in cur.fetchall()]
-    
-    # Mark them all as processed
-    for match_id in match_ids:
-        cur.execute("""
-            INSERT INTO processed_matches (match_id)
-            VALUES (%s)
-            ON CONFLICT DO NOTHING
-        """, (match_id,))
-    
-    conn.commit()
-    cur.close()
-    conn.close()
+    with db_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT DISTINCT match_id FROM predictions")
+        match_ids = [row['match_id'] for row in cur.fetchall()]
+        
+        for match_id in match_ids:
+            cur.execute("""
+                INSERT INTO processed_matches (match_id)
+                VALUES (%s)
+                ON CONFLICT DO NOTHING
+            """, (match_id,))
+        
+        conn.commit()
     
     await interaction.followup.send(f"Marked {len(match_ids)} matches as processed. Points won't be re-awarded.", ephemeral=True)
 
 # ==== USER COMMANDS ====
 @bot.tree.command(name="matches", description="Show upcoming matches")
 async def matches_command(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    
     matches = await fetch_matches()
     if not matches:
-        await interaction.response.send_message("No upcoming matches in the next 24 hours.", ephemeral=True)
+        await interaction.followup.send("No upcoming matches in the next 24 hours.", ephemeral=True)
         return
     
     league_dict = {}
@@ -790,11 +780,9 @@ async def matches_command(interaction: discord.Interaction):
         await interaction.channel.send(f"**{league_name}**")
         for m in league_matches:
             await post_match(m)
+            await asyncio.sleep(0.5)  # Rate limiting
     
-    try:
-        await interaction.response.send_message("Posted upcoming matches!", ephemeral=True)
-    except:
-        pass
+    await interaction.followup.send("Posted upcoming matches!", ephemeral=True)
 
 @bot.tree.command(name="leaderboard", description="Show the leaderboard")
 async def leaderboard_command(interaction: discord.Interaction):
@@ -804,14 +792,12 @@ async def leaderboard_command(interaction: discord.Interaction):
         return
     
     # Get prediction counts for each user
-    conn = get_db()
-    cur = conn.cursor()
     prediction_counts = {}
-    for entry in leaderboard:
-        cur.execute("SELECT COUNT(*) as count FROM predictions WHERE user_id = %s", (entry['user_id'],))
-        prediction_counts[entry['user_id']] = cur.fetchone()['count']
-    cur.close()
-    conn.close()
+    with db_connection() as conn:
+        cur = conn.cursor()
+        for entry in leaderboard:
+            cur.execute("SELECT COUNT(*) as count FROM predictions WHERE user_id = %s", (entry['user_id'],))
+            prediction_counts[entry['user_id']] = cur.fetchone()['count']
     
     # Medal emojis
     medals = ["🥇", "🥈", "🥉", "4.", "5."]
@@ -847,44 +833,29 @@ async def ticket_command(interaction: discord.Interaction, user: discord.Member 
     
     stats = get_user_stats(user_id)
     
-    # Get all user predictions with match results if available
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT p.match_id, p.prediction, pm.home_team, pm.away_team, pm.match_time,
-               CASE WHEN proc.match_id IS NOT NULL THEN TRUE ELSE FALSE END as is_processed
-        FROM predictions p
-        LEFT JOIN posted_matches pm ON p.match_id = pm.match_id
-        LEFT JOIN processed_matches proc ON p.match_id = proc.match_id
-        WHERE p.user_id = %s
-        ORDER BY pm.match_time DESC NULLS LAST
-    """, (user_id,))
-    predictions = cur.fetchall()
-    cur.close()
-    conn.close()
+    # Get all user predictions with match info
+    with db_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT p.match_id, p.prediction, pm.home_team, pm.away_team, pm.match_time,
+                   pm.home_score, pm.away_score, pm.status,
+                   CASE WHEN proc.match_id IS NOT NULL THEN TRUE ELSE FALSE END as is_processed
+            FROM predictions p
+            LEFT JOIN posted_matches pm ON p.match_id = pm.match_id
+            LEFT JOIN processed_matches proc ON p.match_id = proc.match_id
+            WHERE p.user_id = %s
+            ORDER BY pm.match_time DESC NULLS LAST
+        """, (user_id,))
+        predictions = cur.fetchall()
     
     if not predictions:
         await interaction.followup.send(f"{target_user.name} has no predictions yet.", ephemeral=True)
         return
     
-    # Fetch actual results for processed matches to determine if prediction was correct
-    processed_results = {}
-    async with aiohttp.ClientSession() as session:
-        for comp in COMPETITIONS:
-            url = f"{BASE_URL}{comp}/matches"
-            try:
-                async with session.get(url, headers=HEADERS, timeout=aiohttp.ClientTimeout(total=5)) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        for m in data.get("matches", []):
-                            if m.get("status") == "FINISHED":
-                                match_id = str(m["id"])
-                                winner = m.get("score", {}).get("winner")
-                                if winner:
-                                    result_map = {"HOME_TEAM": "home", "AWAY_TEAM": "away", "DRAW": "draw"}
-                                    processed_results[match_id] = result_map.get(winner, winner.lower())
-            except:
-                pass
+    # Use cached results if available, otherwise fetch fresh
+    global cache_timestamp
+    if not cache_timestamp or (datetime.now(timezone.utc) - cache_timestamp) > timedelta(minutes=10):
+        await fetch_all_match_results()
     
     embeds = []
     upcoming_embed = discord.Embed(
@@ -905,9 +876,8 @@ async def ticket_command(interaction: discord.Interaction, user: discord.Member 
     two_days_ago = now - timedelta(days=2)
     
     for pred in predictions:
-        # Only show recent matches (last 2 days + upcoming)
+        # Only show recent matches
         if pred['match_time']:
-            # Make match_time timezone-aware if it isn't
             match_time = pred['match_time']
             if match_time.tzinfo is None:
                 match_time = match_time.replace(tzinfo=timezone.utc)
@@ -916,14 +886,21 @@ async def ticket_command(interaction: discord.Interaction, user: discord.Member 
         
         # Determine if prediction was correct
         result_icon = ""
-        if pred['is_processed'] and pred['match_id'] in processed_results:
-            actual_result = processed_results[pred['match_id']]
+        if pred['status'] == 'FINISHED' and pred['home_score'] is not None:
+            # Determine actual result
+            if pred['home_score'] > pred['away_score']:
+                actual_result = 'home'
+            elif pred['away_score'] > pred['home_score']:
+                actual_result = 'away'
+            else:
+                actual_result = 'draw'
+            
             if actual_result == pred['prediction']:
                 result_icon = " ✅"
             else:
                 result_icon = " ❌"
         
-        # If no match data, show match ID only
+        # Format field
         if not pred['home_team']:
             field_name = f"Match {pred['match_id']}"
             field_value = f"**Prediction:** {pred['prediction'].capitalize()}{result_icon}"
@@ -934,21 +911,21 @@ async def ticket_command(interaction: discord.Interaction, user: discord.Member 
                 match_time = match_time.replace(tzinfo=timezone.utc)
             is_future = match_time > now if match_time else False
             
-            if is_future:
-                status_icon = "🔮"
-                status = "Upcoming"
-                is_finished = False
-            elif pred['is_processed']:
+            if pred['status'] == 'FINISHED' and pred['home_score'] is not None:
                 status_icon = "✅" if result_icon == " ✅" else "❌"
-                status = "Finished"
+                field_name = f"{status_icon} {pred['home_team']} {pred['home_score']}-{pred['away_score']} {pred['away_team']}"
+                field_value = f"**Prediction:** {pred['prediction'].capitalize()}{result_icon}"
                 is_finished = True
+            elif is_future:
+                status_icon = "🔮"
+                field_name = f"{status_icon} {pred['home_team']} vs {pred['away_team']}"
+                field_value = f"**Prediction:** {pred['prediction'].capitalize()}\n**Status:** Upcoming"
+                is_finished = False
             else:
                 status_icon = "⏳"
-                status = "In Progress"
+                field_name = f"{status_icon} {pred['home_team']} vs {pred['away_team']}"
+                field_value = f"**Prediction:** {pred['prediction'].capitalize()}\n**Status:** In Progress"
                 is_finished = False
-            
-            field_name = f"{status_icon} {pred['home_team']} vs {pred['away_team']}"
-            field_value = f"**Prediction:** {pred['prediction'].capitalize()}{result_icon}\n**Status:** {status}"
         
         # Add to appropriate embed
         if is_finished:
@@ -1001,6 +978,8 @@ async def daily_fetch_matches():
     matches = await fetch_matches()
     for m in matches:
         await post_match(m)
+        await asyncio.sleep(1)
+
 scheduler.add_job(lambda: bot.loop.create_task(daily_fetch_matches()), "cron", hour=6, minute=0)
 
 bot.run(DISCORD_BOT_TOKEN)
