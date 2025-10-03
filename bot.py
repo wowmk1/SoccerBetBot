@@ -48,13 +48,12 @@ def init_db():
     with db_connection() as conn:
         cur = conn.cursor()
         
+        # Create base tables
         cur.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 user_id TEXT PRIMARY KEY,
                 username TEXT NOT NULL,
-                points INTEGER DEFAULT 0,
-                current_streak INTEGER DEFAULT 0,
-                best_streak INTEGER DEFAULT 0
+                points INTEGER DEFAULT 0
             )
         """)
         
@@ -75,12 +74,7 @@ def init_db():
                 home_team TEXT,
                 away_team TEXT,
                 match_time TIMESTAMP,
-                competition TEXT,
-                home_score INTEGER,
-                away_score INTEGER,
-                status TEXT DEFAULT 'SCHEDULED',
-                posted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                notification_sent BOOLEAN DEFAULT FALSE
+                posted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
         
@@ -88,7 +82,6 @@ def init_db():
             CREATE TABLE IF NOT EXISTS vote_data (
                 match_id TEXT PRIMARY KEY,
                 votes_msg_id BIGINT,
-                live_predictions_msg_id BIGINT,
                 buttons_disabled BOOLEAN DEFAULT FALSE
             )
         """)
@@ -100,6 +93,17 @@ def init_db():
             )
         """)
         
+        # Add new columns to existing tables (safe if they already exist)
+        cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS current_streak INTEGER DEFAULT 0")
+        cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS best_streak INTEGER DEFAULT 0")
+        cur.execute("ALTER TABLE vote_data ADD COLUMN IF NOT EXISTS live_predictions_msg_id BIGINT")
+        cur.execute("ALTER TABLE posted_matches ADD COLUMN IF NOT EXISTS competition TEXT")
+        cur.execute("ALTER TABLE posted_matches ADD COLUMN IF NOT EXISTS home_score INTEGER")
+        cur.execute("ALTER TABLE posted_matches ADD COLUMN IF NOT EXISTS away_score INTEGER")
+        cur.execute("ALTER TABLE posted_matches ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'SCHEDULED'")
+        cur.execute("ALTER TABLE posted_matches ADD COLUMN IF NOT EXISTS notification_sent BOOLEAN DEFAULT FALSE")
+        
+        # Create weekly_stats table
         cur.execute("""
             CREATE TABLE IF NOT EXISTS weekly_stats (
                 user_id TEXT NOT NULL,
@@ -111,6 +115,7 @@ def init_db():
         """)
         
         conn.commit()
+        print("Database initialized successfully")
 
 def get_leaderboard():
     """Get all users sorted by points"""
