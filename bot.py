@@ -824,20 +824,32 @@ async def ticket_command(interaction: discord.Interaction, user: discord.Member 
                 pass
     
     embeds = []
-    current_embed = discord.Embed(
+    upcoming_embed = discord.Embed(
         title=f"🎫 {target_user.name}'s Predictions",
         description=f"**Points:** {user_data['points']} | **Accuracy:** {stats['accuracy']:.1f}% ({stats['correct']}/{stats['total']})",
         color=discord.Color.blue()
     )
     
-    field_count = 0
+    finished_embed = discord.Embed(
+        title=f"🏆 Finished Matches",
+        description=f"Recent completed predictions",
+        color=discord.Color.gold()
+    )
+    
+    upcoming_count = 0
+    finished_count = 0
     now = datetime.now(timezone.utc)
     two_days_ago = now - timedelta(days=2)
     
     for pred in predictions:
         # Only show recent matches (last 2 days + upcoming)
-        if pred['match_time'] and pred['match_time'] < two_days_ago:
-            continue
+        if pred['match_time']:
+            # Make match_time timezone-aware if it isn't
+            match_time = pred['match_time']
+            if match_time.tzinfo is None:
+                match_time = match_time.replace(tzinfo=timezone.utc)
+            if match_time < two_days_ago:
+                continue
         
         # Determine if prediction was correct
         result_icon = ""
@@ -852,39 +864,60 @@ async def ticket_command(interaction: discord.Interaction, user: discord.Member 
         if not pred['home_team']:
             field_name = f"Match {pred['match_id']}"
             field_value = f"**Prediction:** {pred['prediction'].capitalize()}{result_icon}"
+            is_finished = pred['is_processed']
         else:
             match_time = pred['match_time']
+            if match_time.tzinfo is None:
+                match_time = match_time.replace(tzinfo=timezone.utc)
             is_future = match_time > now if match_time else False
             
             if is_future:
                 status_icon = "🔮"
                 status = "Upcoming"
+                is_finished = False
             elif pred['is_processed']:
                 status_icon = "✅" if result_icon == " ✅" else "❌"
                 status = "Finished"
+                is_finished = True
             else:
                 status_icon = "⏳"
                 status = "In Progress"
+                is_finished = False
             
             field_name = f"{status_icon} {pred['home_team']} vs {pred['away_team']}"
             field_value = f"**Prediction:** {pred['prediction'].capitalize()}{result_icon}\n**Status:** {status}"
         
-        if field_count >= 20:
-            embeds.append(current_embed)
-            current_embed = discord.Embed(
-                title=f"🎫 {target_user.name}'s Predictions (cont.)",
-                color=discord.Color.blue()
-            )
-            field_count = 0
-        
-        current_embed.add_field(name=field_name, value=field_value, inline=False)
-        field_count += 1
+        # Add to appropriate embed
+        if is_finished:
+            if finished_count >= 20:
+                embeds.append(finished_embed)
+                finished_embed = discord.Embed(
+                    title=f"🏆 Finished Matches (cont.)",
+                    color=discord.Color.gold()
+                )
+                finished_count = 0
+            finished_embed.add_field(name=field_name, value=field_value, inline=False)
+            finished_count += 1
+        else:
+            if upcoming_count >= 20:
+                embeds.append(upcoming_embed)
+                upcoming_embed = discord.Embed(
+                    title=f"🎫 {target_user.name}'s Predictions (cont.)",
+                    color=discord.Color.blue()
+                )
+                upcoming_count = 0
+            upcoming_embed.add_field(name=field_name, value=field_value, inline=False)
+            upcoming_count += 1
     
-    if field_count == 0:
+    # Add embeds with content
+    if upcoming_count > 0:
+        embeds.insert(0, upcoming_embed)
+    if finished_count > 0:
+        embeds.append(finished_embed)
+    
+    if not embeds:
         await interaction.response.send_message(f"{target_user.name} has no recent predictions to display.", ephemeral=True)
         return
-    
-    embeds.append(current_embed)
     
     await interaction.response.send_message(embed=embeds[0], ephemeral=True)
     for embed in embeds[1:]:
