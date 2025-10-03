@@ -69,6 +69,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS vote_data (
             match_id TEXT PRIMARY KEY,
             votes_msg_id BIGINT,
+            live_predictions_msg_id BIGINT,
             buttons_disabled BOOLEAN DEFAULT FALSE
         )
     """)
@@ -247,6 +248,29 @@ def save_vote_message(match_id, msg_id):
     cur.close()
     conn.close()
 
+def save_live_predictions_message(match_id, msg_id):
+    """Save live predictions message ID"""
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("""
+        UPDATE vote_data
+        SET live_predictions_msg_id = %s
+        WHERE match_id = %s
+    """, (msg_id, match_id))
+    conn.commit()
+    cur.close()
+    conn.close()
+
+def get_live_predictions_message_id(match_id):
+    """Get live predictions message ID"""
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT live_predictions_msg_id FROM vote_data WHERE match_id = %s", (match_id,))
+    result = cur.fetchone()
+    cur.close()
+    conn.close()
+    return result['live_predictions_msg_id'] if result else None
+
 def get_vote_message_id(match_id):
     """Get vote message ID"""
     conn = get_db()
@@ -284,15 +308,56 @@ COMPETITIONS = ["PL", "CL", "BL1", "PD", "FL1", "SA"]
 last_leaderboard_msg_id = None
 
 # ==== VOTES EMBED CREATION ====
-def create_votes_embed(match_id, match_result=None):
+def create_live_predictions_embed(match_id, home_team, away_team):
+    """Create live predictions embed showing vote breakdown"""
     votes = get_predictions_for_match(match_id)
-    embed = discord.Embed(title="Current Votes", color=discord.Color.green())
-    for option in ["home", "draw", "away"]:
-        voters = sorted(votes[option])
-        field_value = "\n".join(voters) if voters else "No votes yet"
-        if match_result == option:
-            field_value += "\n✅ Correct!"
-        embed.add_field(name=option.capitalize(), value=field_value, inline=False)
+    
+    total_votes = len(votes['home']) + len(votes['draw']) + len(votes['away'])
+    
+    if total_votes == 0:
+        home_pct = draw_pct = away_pct = 0
+    else:
+        home_pct = (len(votes['home']) / total_votes) * 100
+        draw_pct = (len(votes['draw']) / total_votes) * 100
+        away_pct = (len(votes['away']) / total_votes) * 100
+    
+    embed = discord.Embed(
+        title="📊 Live Predictions",
+        description=f"**{home_team} vs {away_team}**\n🔮 {total_votes} predictions so far",
+        color=discord.Color.green()
+    )
+    
+    # Home predictions
+    home_users = ", ".join(sorted(votes['home'])) if votes['home'] else "No predictions yet"
+    embed.add_field(
+        name=f"🏠 {home_team} ({len(votes['home'])})",
+        value=home_users,
+        inline=False
+    )
+    
+    # Draw predictions
+    draw_users = ", ".join(sorted(votes['draw'])) if votes['draw'] else "No predictions yet"
+    embed.add_field(
+        name=f"🤝 Draw ({len(votes['draw'])})",
+        value=draw_users,
+        inline=False
+    )
+    
+    # Away predictions
+    away_users = ", ".join(sorted(votes['away'])) if votes['away'] else "No predictions yet"
+    embed.add_field(
+        name=f"✈️ {away_team} ({len(votes['away'])})",
+        value=away_users,
+        inline=False
+    )
+    
+    # Prediction breakdown
+    embed.add_field(
+        name="📈 Prediction Breakdown",
+        value=f"🏠 {home_pct:.0f}% • 🤝 {draw_pct:.0f}% • ✈️ {away_pct:.0f}%",
+        inline=False
+    )
+    
     return embed
 
 # ==== GENERATE MATCH IMAGE ====
@@ -367,18 +432,24 @@ class VoteButton(Button):
         upsert_user(user_id, user.name)
         add_prediction(user_id, match_id, self.category)
         
-        vote_msg = get_vote_message_id(match_id)
-        embed = create_votes_embed(match_id)
-        if vote_msg and vote_msg['votes_msg_id']:
-            try:
-                votes_message = await interaction.channel.fetch_message(vote_msg['votes_msg_id'])
-                await votes_message.edit(embed=embed)
-            except:
-                votes_message = await interaction.channel.send(embed=embed)
-                save_vote_message(match_id, votes_message.id)
-        else:
-            votes_message = await interaction.channel.send(embed=embed)
-            save_vote_message(match_id, votes_message.id)
+        # Get match info for live predictions
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("SELECT home_team, away_team FROM posted_matches WHERE match_id = %s", (match_id,))
+        match_data = cur.fetchone()
+        cur.close()
+        conn.close()
+        
+        # Update live predictions embed
+        if match_data:
+            live_msg_id = get_live_predictions_message_id(match_id)
+            if live_msg_id:
+                try:
+                    live_message = await interaction.channel.fetch_message(live_msg_id)
+                    embed = create_live_predictions_embed(match_id, match_data['home_team'], match_data['away_team'])
+                    await live_message.edit(embed=embed)
+                except Exception as e:
+                    print(f"Failed to update live predictions: {e}")
         
         await interaction.response.send_message(f"You voted for **{self.label}**!", ephemeral=True)
 
@@ -397,8 +468,11 @@ async def post_match(match):
     if not channel:
         return
     
+    home_team = match['homeTeam']['name']
+    away_team = match['awayTeam']['name']
+    
     embed = discord.Embed(
-        title=f"{match['homeTeam']['name']} vs {match['awayTeam']['name']}",
+        title=f"{home_team} vs {away_team}",
         description=f"Kickoff: <t:{kickoff_ts}:f>",
         color=discord.Color.blue()
     )
@@ -416,9 +490,15 @@ async def post_match(match):
     view.add_item(VoteButton("Draw", "draw", match_id, kickoff_time=match_time))
     view.add_item(VoteButton("Away", "away", match_id, kickoff_time=match_time))
     
-    votes_message = await channel.send(embed=embed, file=file, view=view)
-    save_vote_message(match_id, votes_message.id)
-    mark_match_posted(match_id, match['homeTeam']['name'], match['awayTeam']['name'], match_time)
+    match_message = await channel.send(embed=embed, file=file, view=view)
+    save_vote_message(match_id, match_message.id)
+    
+    # Post live predictions embed below
+    live_embed = create_live_predictions_embed(match_id, home_team, away_team)
+    live_message = await channel.send(embed=live_embed)
+    save_live_predictions_message(match_id, live_message.id)
+    
+    mark_match_posted(match_id, home_team, away_team, match_time)
 
 # ==== UPDATE MATCH RESULTS ====
 @tasks.loop(minutes=5)
@@ -704,13 +784,15 @@ async def ticket_command(interaction: discord.Interaction, user: discord.Member 
     
     stats = get_user_stats(user_id)
     
-    # Get all user predictions
+    # Get all user predictions with match results if available
     conn = get_db()
     cur = conn.cursor()
     cur.execute("""
-        SELECT p.match_id, p.prediction, pm.home_team, pm.away_team, pm.match_time
+        SELECT p.match_id, p.prediction, pm.home_team, pm.away_team, pm.match_time,
+               CASE WHEN proc.match_id IS NOT NULL THEN TRUE ELSE FALSE END as is_processed
         FROM predictions p
         LEFT JOIN posted_matches pm ON p.match_id = pm.match_id
+        LEFT JOIN processed_matches proc ON p.match_id = proc.match_id
         WHERE p.user_id = %s
         ORDER BY pm.match_time DESC NULLS LAST
     """, (user_id,))
@@ -722,10 +804,29 @@ async def ticket_command(interaction: discord.Interaction, user: discord.Member 
         await interaction.response.send_message(f"{target_user.name} has no predictions yet.", ephemeral=True)
         return
     
+    # Fetch actual results for processed matches to determine if prediction was correct
+    processed_results = {}
+    async with aiohttp.ClientSession() as session:
+        for comp in COMPETITIONS:
+            url = f"{BASE_URL}{comp}/matches"
+            try:
+                async with session.get(url, headers=HEADERS, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        for m in data.get("matches", []):
+                            if m.get("status") == "FINISHED":
+                                match_id = str(m["id"])
+                                winner = m.get("score", {}).get("winner")
+                                if winner:
+                                    result_map = {"HOME_TEAM": "home", "AWAY_TEAM": "away", "DRAW": "draw"}
+                                    processed_results[match_id] = result_map.get(winner, winner.lower())
+            except:
+                pass
+    
     embeds = []
     current_embed = discord.Embed(
-        title=f"{target_user.name}'s Predictions",
-        description=f"Points: {user_data['points']} | Accuracy: {stats['accuracy']:.1f}% ({stats['correct']}/{stats['total']})",
+        title=f"🎫 {target_user.name}'s Predictions",
+        description=f"**Points:** {user_data['points']} | **Accuracy:** {stats['accuracy']:.1f}% ({stats['correct']}/{stats['total']})",
         color=discord.Color.blue()
     )
     
@@ -738,21 +839,40 @@ async def ticket_command(interaction: discord.Interaction, user: discord.Member 
         if pred['match_time'] and pred['match_time'] < two_days_ago:
             continue
         
+        # Determine if prediction was correct
+        result_icon = ""
+        if pred['is_processed'] and pred['match_id'] in processed_results:
+            actual_result = processed_results[pred['match_id']]
+            if actual_result == pred['prediction']:
+                result_icon = " ✅"
+            else:
+                result_icon = " ❌"
+        
         # If no match data, show match ID only
         if not pred['home_team']:
             field_name = f"Match {pred['match_id']}"
-            field_value = f"Prediction: {pred['prediction'].capitalize()}"
+            field_value = f"**Prediction:** {pred['prediction'].capitalize()}{result_icon}"
         else:
             match_time = pred['match_time']
             is_future = match_time > now if match_time else False
-            status = "Upcoming" if is_future else "Played"
-            field_name = f"{pred['home_team']} vs {pred['away_team']}"
-            field_value = f"Prediction: {pred['prediction'].capitalize()}\nStatus: {status}"
+            
+            if is_future:
+                status_icon = "🔮"
+                status = "Upcoming"
+            elif pred['is_processed']:
+                status_icon = "✅" if result_icon == " ✅" else "❌"
+                status = "Finished"
+            else:
+                status_icon = "⏳"
+                status = "In Progress"
+            
+            field_name = f"{status_icon} {pred['home_team']} vs {pred['away_team']}"
+            field_value = f"**Prediction:** {pred['prediction'].capitalize()}{result_icon}\n**Status:** {status}"
         
         if field_count >= 20:
             embeds.append(current_embed)
             current_embed = discord.Embed(
-                title=f"{target_user.name}'s Predictions (cont.)",
+                title=f"🎫 {target_user.name}'s Predictions (cont.)",
                 color=discord.Color.blue()
             )
             field_count = 0
