@@ -609,8 +609,34 @@ async def leaderboard_command(interaction: discord.Interaction):
         await interaction.response.send_message("Leaderboard is empty.", ephemeral=True)
         return
     
-    desc = "\n".join([f"**{i+1}. {entry['username']}** — {entry['points']} pts" for i, entry in enumerate(leaderboard[:10])])
-    embed = discord.Embed(title="Leaderboard", description=desc, color=discord.Color.gold())
+    # Get prediction counts for each user
+    conn = get_db()
+    cur = conn.cursor()
+    prediction_counts = {}
+    for entry in leaderboard:
+        cur.execute("SELECT COUNT(*) as count FROM predictions WHERE user_id = %s", (entry['user_id'],))
+        prediction_counts[entry['user_id']] = cur.fetchone()['count']
+    cur.close()
+    conn.close()
+    
+    # Medal emojis
+    medals = ["🥇", "🥈", "🥉", "4.", "5."]
+    
+    embed = discord.Embed(title="🏆 Prediction Leaderboard", color=discord.Color.gold())
+    
+    desc_lines = []
+    for i, entry in enumerate(leaderboard[:5]):
+        medal = medals[i] if i < len(medals) else f"{i+1}."
+        pred_count = prediction_counts.get(entry['user_id'], 0)
+        desc_lines.append(f"{medal} **{entry['username']}** — **{entry['points']} pts** *({pred_count} predictions)*")
+    
+    embed.description = "\n".join(desc_lines)
+    
+    # Footer
+    total_players = len(leaderboard)
+    total_predictions = sum(prediction_counts.values())
+    embed.set_footer(text=f"{total_players} players • 🎯 {total_predictions} total predictions")
+    
     await interaction.response.send_message(embed=embed)
 
 @bot.tree.command(name="ticket", description="Show your predictions")
@@ -624,18 +650,24 @@ async def ticket_command(interaction: discord.Interaction, user: discord.Member 
         return
     
     stats = get_user_stats(user_id)
-    recent_matches = get_recent_matches()
     
+    # Get all user predictions
     conn = get_db()
     cur = conn.cursor()
     cur.execute("""
-        SELECT match_id, prediction
-        FROM predictions
-        WHERE user_id = %s
+        SELECT p.match_id, p.prediction, pm.home_team, pm.away_team, pm.match_time
+        FROM predictions p
+        LEFT JOIN posted_matches pm ON p.match_id = pm.match_id
+        WHERE p.user_id = %s
+        ORDER BY pm.match_time DESC NULLS LAST
     """, (user_id,))
-    user_predictions = {row['match_id']: row['prediction'] for row in cur.fetchall()}
+    predictions = cur.fetchall()
     cur.close()
     conn.close()
+    
+    if not predictions:
+        await interaction.response.send_message(f"{target_user.name} has no predictions yet.", ephemeral=True)
+        return
     
     embeds = []
     current_embed = discord.Embed(
@@ -645,18 +677,24 @@ async def ticket_command(interaction: discord.Interaction, user: discord.Member 
     )
     
     field_count = 0
-    for match in recent_matches:
-        match_id = match['match_id']
-        if match_id not in user_predictions:
+    now = datetime.now(timezone.utc)
+    two_days_ago = now - timedelta(days=2)
+    
+    for pred in predictions:
+        # Only show recent matches (last 2 days + upcoming)
+        if pred['match_time'] and pred['match_time'] < two_days_ago:
             continue
         
-        prediction = user_predictions[match_id]
-        match_time = match['match_time']
-        is_future = match_time > datetime.now(timezone.utc)
-        
-        status = "Upcoming" if is_future else "Played"
-        field_name = f"{match['home_team']} vs {match['away_team']}"
-        field_value = f"Prediction: {prediction.capitalize()}\nStatus: {status}"
+        # If no match data, show match ID only
+        if not pred['home_team']:
+            field_name = f"Match {pred['match_id']}"
+            field_value = f"Prediction: {pred['prediction'].capitalize()}"
+        else:
+            match_time = pred['match_time']
+            is_future = match_time > now if match_time else False
+            status = "Upcoming" if is_future else "Played"
+            field_name = f"{pred['home_team']} vs {pred['away_team']}"
+            field_value = f"Prediction: {pred['prediction'].capitalize()}\nStatus: {status}"
         
         if field_count >= 20:
             embeds.append(current_embed)
@@ -668,6 +706,10 @@ async def ticket_command(interaction: discord.Interaction, user: discord.Member 
         
         current_embed.add_field(name=field_name, value=field_value, inline=False)
         field_count += 1
+    
+    if field_count == 0:
+        await interaction.response.send_message(f"{target_user.name} has no recent predictions to display.", ephemeral=True)
+        return
     
     embeds.append(current_embed)
     
