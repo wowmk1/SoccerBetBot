@@ -684,7 +684,42 @@ async def restore_command(interaction: discord.Interaction, backup_file: discord
     except Exception as e:
         await interaction.followup.send(f"Error restoring data: {str(e)}", ephemeral=True)
 
-@bot.tree.command(name="fixpoints", description="[ADMIN] Mark old matches as processed")
+@bot.tree.command(name="forcefetch", description="[ADMIN] Force fetch and post upcoming matches")
+async def forcefetch_command(interaction: discord.Interaction):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("Admin only", ephemeral=True)
+        return
+    
+    await interaction.response.defer(ephemeral=True)
+    
+    now = datetime.now(timezone.utc)
+    next_48h = now + timedelta(hours=48)
+    matches = []
+    
+    async with aiohttp.ClientSession() as session:
+        for comp in COMPETITIONS:
+            url = f"{BASE_URL}{comp}/matches?dateFrom={now.date()}&dateTo={next_48h.date()}"
+            async with session.get(url, headers=HEADERS) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    for m in data.get("matches", []):
+                        m["competition"]["name"] = data.get("competition", {}).get("name", comp)
+                        matches.append(m)
+    
+    upcoming = [m for m in matches if now <= datetime.fromisoformat(m['utcDate'].replace("Z", "+00:00")) <= next_48h]
+    
+    if not upcoming:
+        await interaction.followup.send(f"No matches found in next 48 hours. Total fetched: {len(matches)}", ephemeral=True)
+        return
+    
+    posted_count = 0
+    for match in upcoming:
+        match_id = str(match["id"])
+        if not is_match_posted(match_id):
+            await post_match(match)
+            posted_count += 1
+    
+    await interaction.followup.send(f"Found {len(upcoming)} matches. Posted {posted_count} new matches.", ephemeral=True)
 async def fixpoints_command(interaction: discord.Interaction):
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("Admin only", ephemeral=True)
