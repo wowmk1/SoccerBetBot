@@ -633,71 +633,71 @@ class VoteButton(Button):
         self.category = category
         self.match_id = match_id
 
-    async def callback(self, interaction: discord.Interaction):
-        # Fetch match info from database to check kickoff time
-        match_info = get_match_info(self.match_id)
-        if not match_info:
-            await interaction.response.send_message("Match not found!", ephemeral=True)
+async def callback(self, interaction: discord.Interaction):
+    # DEFER FIRST - must happen within 3 seconds
+    await interaction.response.defer(ephemeral=True)
+    
+    # Now we can take our time with database operations
+    match_info = get_match_info(self.match_id)
+    if not match_info:
+        await interaction.followup.send("Match not found!", ephemeral=True)
+        return
+    
+    match_time = match_info['match_time']
+    if match_time.tzinfo is None:
+        match_time = match_time.replace(tzinfo=timezone.utc)
+    
+    now = datetime.now(timezone.utc)
+    if now >= match_time:
+        await interaction.followup.send("Voting for this match has ended!", ephemeral=True)
+        return
+    
+    user = interaction.user
+    user_id = str(user.id)
+    match_id = self.match_id
+    
+    # Check if user already has a prediction
+    existing_prediction = get_user_prediction(user_id, match_id)
+    
+    if existing_prediction:
+        if existing_prediction == self.category:
+            await interaction.followup.send(f"You already voted for **{self.label}**!", ephemeral=True)
             return
-        
-        match_time = match_info['match_time']
-        if match_time.tzinfo is None:
-            match_time = match_time.replace(tzinfo=timezone.utc)
-        
-        now = datetime.now(timezone.utc)
-        if now >= match_time:
-            await interaction.response.send_message("Voting for this match has ended!", ephemeral=True)
+        else:
+            # Update prediction
+            upsert_user(user_id, user.name)
+            update_prediction(user_id, match_id, self.category)
+            
+            # Update live predictions embed
+            if match_info:
+                live_msg_id = get_live_predictions_message_id(match_id)
+                if live_msg_id:
+                    try:
+                        live_message = await interaction.channel.fetch_message(live_msg_id)
+                        embed = create_live_predictions_embed(match_id, match_info['home_team'], match_info['away_team'])
+                        await live_message.edit(embed=embed)
+                    except Exception as e:
+                        print(f"Failed to update live predictions: {e}")
+            
+            await interaction.followup.send(f"Changed your vote to **{self.label}**!", ephemeral=True)
             return
-        
-        # Defer immediately after time check
-        await interaction.response.defer(ephemeral=True)
-        
-        user = interaction.user
-        user_id = str(user.id)
-        match_id = self.match_id
-        
-        # Check if user already has a prediction
-        existing_prediction = get_user_prediction(user_id, match_id)
-        
-        if existing_prediction:
-            if existing_prediction == self.category:
-                await interaction.followup.send(f"You already voted for **{self.label}**!", ephemeral=True)
-                return
-            else:
-                # Update prediction
-                upsert_user(user_id, user.name)
-                update_prediction(user_id, match_id, self.category)
-                
-                # Update live predictions embed
-                if match_info:
-                    live_msg_id = get_live_predictions_message_id(match_id)
-                    if live_msg_id:
-                        try:
-                            live_message = await interaction.channel.fetch_message(live_msg_id)
-                            embed = create_live_predictions_embed(match_id, match_info['home_team'], match_info['away_team'])
-                            await live_message.edit(embed=embed)
-                        except Exception as e:
-                            print(f"Failed to update live predictions: {e}")
-                
-                await interaction.followup.send(f"Changed your vote to **{self.label}**!", ephemeral=True)
-                return
-        
-        # New prediction
-        upsert_user(user_id, user.name)
-        add_prediction(user_id, match_id, self.category)
-        
-        # Update live predictions embed
-        if match_info:
-            live_msg_id = get_live_predictions_message_id(match_id)
-            if live_msg_id:
-                try:
-                    live_message = await interaction.channel.fetch_message(live_msg_id)
-                    embed = create_live_predictions_embed(match_id, match_info['home_team'], match_info['away_team'])
-                    await live_message.edit(embed=embed)
-                except Exception as e:
-                    print(f"Failed to update live predictions: {e}")
-        
-        await interaction.followup.send(f"You voted for **{self.label}**!", ephemeral=True)
+    
+    # New prediction
+    upsert_user(user_id, user.name)
+    add_prediction(user_id, match_id, self.category)
+    
+    # Update live predictions embed
+    if match_info:
+        live_msg_id = get_live_predictions_message_id(match_id)
+        if live_msg_id:
+            try:
+                live_message = await interaction.channel.fetch_message(live_msg_id)
+                embed = create_live_predictions_embed(match_id, match_info['home_team'], match_info['away_team'])
+                await live_message.edit(embed=embed)
+            except Exception as e:
+                print(f"Failed to update live predictions: {e}")
+    
+    await interaction.followup.send(f"You voted for **{self.label}**!", ephemeral=True)
 
 # ==== PERSISTENT VOTE VIEW ====
 class PersistentVoteView(View):
@@ -1985,3 +1985,4 @@ async def daily_fetch_matches():
 scheduler.add_job(lambda: bot.loop.create_task(daily_fetch_matches()), "cron", hour=6, minute=0)
 
 bot.run(DISCORD_BOT_TOKEN)
+
