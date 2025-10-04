@@ -633,79 +633,84 @@ class VoteButton(Button):
         self.category = category
         self.match_id = match_id
 
-async def callback(self, interaction: discord.Interaction):
-    # DEFER FIRST - must happen within 3 seconds
-    await interaction.response.defer(ephemeral=True)
-    
-    # Now we can take our time with database operations
-    match_info = get_match_info(self.match_id)
-    if not match_info:
-        await interaction.followup.send("Match not found!", ephemeral=True)
-        return
-    
-    match_time = match_info['match_time']
-    if match_time.tzinfo is None:
-        match_time = match_time.replace(tzinfo=timezone.utc)
-    
-    now = datetime.now(timezone.utc)
-    if now >= match_time:
-        await interaction.followup.send("Voting for this match has ended!", ephemeral=True)
-        return
-    
-    user = interaction.user
-    user_id = str(user.id)
-    match_id = self.match_id
-    
-    # Check if user already has a prediction
-    existing_prediction = get_user_prediction(user_id, match_id)
-    
-    if existing_prediction:
-        if existing_prediction == self.category:
-            await interaction.followup.send(f"You already voted for **{self.label}**!", ephemeral=True)
+    async def callback(self, interaction: discord.Interaction):
+        # DEFER FIRST
+        try:
+            await interaction.response.defer(ephemeral=True)
+        except Exception as e:
+            print(f"Failed to defer: {e}")
             return
-        else:
-            # Update prediction
-            upsert_user(user_id, user.name)
-            update_prediction(user_id, match_id, self.category)
-            
-            # Update live predictions embed
-            if match_info:
-                live_msg_id = get_live_predictions_message_id(match_id)
-                if live_msg_id:
-                    try:
-                        live_message = await interaction.channel.fetch_message(live_msg_id)
-                        embed = create_live_predictions_embed(match_id, match_info['home_team'], match_info['away_team'])
-                        await live_message.edit(embed=embed)
-                    except Exception as e:
-                        print(f"Failed to update live predictions: {e}")
-            
-            await interaction.followup.send(f"Changed your vote to **{self.label}**!", ephemeral=True)
+        
+        # Now we can take our time with database operations
+        match_info = get_match_info(self.match_id)
+        if not match_info:
+            await interaction.followup.send("Match not found!", ephemeral=True)
             return
-    
-    # New prediction
-    upsert_user(user_id, user.name)
-    add_prediction(user_id, match_id, self.category)
-    
-    # Update live predictions embed
-    if match_info:
-        live_msg_id = get_live_predictions_message_id(match_id)
-        if live_msg_id:
-            try:
-                live_message = await interaction.channel.fetch_message(live_msg_id)
-                embed = create_live_predictions_embed(match_id, match_info['home_team'], match_info['away_team'])
-                await live_message.edit(embed=embed)
-            except Exception as e:
-                print(f"Failed to update live predictions: {e}")
-    
-    await interaction.followup.send(f"You voted for **{self.label}**!", ephemeral=True)
+        
+        match_time = match_info['match_time']
+        if match_time.tzinfo is None:
+            match_time = match_time.replace(tzinfo=timezone.utc)
+        
+        now = datetime.now(timezone.utc)
+        if now >= match_time:
+            await interaction.followup.send("Voting for this match has ended!", ephemeral=True)
+            return
+        
+        user = interaction.user
+        user_id = str(user.id)
+        match_id = self.match_id
+        
+        # Check if user already has a prediction
+        existing_prediction = get_user_prediction(user_id, match_id)
+        
+        if existing_prediction:
+            if existing_prediction == self.category:
+                await interaction.followup.send(f"You already voted for **{self.label}**!", ephemeral=True)
+                return
+            else:
+                # Update prediction
+                upsert_user(user_id, user.name)
+                update_prediction(user_id, match_id, self.category)
+                
+                # Update live predictions embed
+                if match_info:
+                    live_msg_id = get_live_predictions_message_id(match_id)
+                    if live_msg_id:
+                        try:
+                            live_message = await interaction.channel.fetch_message(live_msg_id)
+                            embed = create_live_predictions_embed(match_id, match_info['home_team'], match_info['away_team'])
+                            await live_message.edit(embed=embed)
+                        except Exception as e:
+                            print(f"Failed to update live predictions: {e}")
+                
+                await interaction.followup.send(f"Changed your vote to **{self.label}**!", ephemeral=True)
+                return
+        
+        # New prediction
+        upsert_user(user_id, user.name)
+        add_prediction(user_id, match_id, self.category)
+        
+        # Update live predictions embed
+        if match_info:
+            live_msg_id = get_live_predictions_message_id(match_id)
+            if live_msg_id:
+                try:
+                    live_message = await interaction.channel.fetch_message(live_msg_id)
+                    embed = create_live_predictions_embed(match_id, match_info['home_team'], match_info['away_team'])
+                    await live_message.edit(embed=embed)
+                except Exception as e:
+                    print(f"Failed to update live predictions: {e}")
+        
+        await interaction.followup.send(f"You voted for **{self.label}**!", ephemeral=True)
 
 # ==== PERSISTENT VOTE VIEW ====
 class PersistentVoteView(View):
-    def __init__(self, match_id):
+    def __init__(self, match_id=None):
         super().__init__(timeout=None)
-        self.add_item(VoteButton("🏠 Home", "home", match_id))
-        self.add_item(VoteButton("🤝 Draw", "draw", match_id))
-        self.add_item(VoteButton("✈️ Away", "away", match_id))
+        if match_id:
+            self.add_item(VoteButton("🏠 Home", "home", match_id))
+            self.add_item(VoteButton("🤝 Draw", "draw", match_id))
+            self.add_item(VoteButton("✈️ Away", "away", match_id))
 
 # ==== POST MATCH ==== (continued)
 async def post_match(match):
@@ -1962,10 +1967,11 @@ async def compare_command(interaction: discord.Interaction, user: discord.Member
 @bot.event
 async def on_ready():
     init_db()
-    await bot.tree.sync()
     
-    # Re-register persistent views for existing buttons
-    bot.add_view(PersistentVoteView("dummy"))  # This registers the view class
+    # Add persistent view - this is CRITICAL for persistent buttons to work
+    bot.add_view(PersistentVoteView())
+    
+    await bot.tree.sync()
     
     update_match_results.start()
     send_match_notifications.start()
@@ -1985,4 +1991,5 @@ async def daily_fetch_matches():
 scheduler.add_job(lambda: bot.loop.create_task(daily_fetch_matches()), "cron", hour=6, minute=0)
 
 bot.run(DISCORD_BOT_TOKEN)
+
 
