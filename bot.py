@@ -1204,7 +1204,142 @@ async def forcefetch_command(interaction: discord.Interaction):
     
     await interaction.followup.send(f"Found {len(upcoming)} matches. Posted {posted_count} new matches.", ephemeral=True)
 
-@bot.tree.command(name="fixpoints", description="[ADMIN] Mark all existing matches as processed")
+@bot.tree.command(name="checkdb", description="[ADMIN] Check database status")
+async def checkdb_command(interaction: discord.Interaction):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("Admin only", ephemeral=True)
+        return
+    
+    with db_connection() as conn:
+        cur = conn.cursor()
+        
+        # Check finished matches
+        cur.execute("SELECT COUNT(*) as count FROM posted_matches WHERE home_score IS NOT NULL")
+        finished = cur.fetchone()['count']
+        
+        # Check total matches
+        cur.execute("SELECT COUNT(*) as count FROM posted_matches")
+        total = cur.fetchone()['count']
+        
+        # Check processed matches
+        cur.execute("SELECT COUNT(*) as count FROM processed_matches")
+        processed = cur.fetchone()['count']
+        
+        # Check total predictions
+        cur.execute("SELECT COUNT(*) as count FROM predictions")
+        total_preds = cur.fetchone()['count']
+        
+        await interaction.response.send_message(
+            f"**Database Status:**\n"
+            f"Total matches posted: {total}\n"
+            f"Matches with scores: {finished}\n"
+            f"Processed matches: {processed}\n"
+            f"Total predictions: {total_preds}",
+            ephemeral=True
+        )
+
+@bot.tree.command(name="repostmatches", description="[ADMIN] Repost all upcoming matches")
+async def repostmatches_command(interaction: discord.Interaction):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("Admin only", ephemeral=True)
+        return
+    
+    await interaction.response.defer(ephemeral=True)
+    
+    now = datetime.now(timezone.utc)
+    
+    # Get all upcoming matches from database
+    with db_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT match_id, home_team, away_team, match_time, competition
+            FROM posted_matches
+            WHERE match_time > %s AND status != 'FINISHED'
+            ORDER BY match_time ASC
+        """, (now,))
+        matches = cur.fetchall()
+    
+    if not matches:
+        await interaction.followup.send("No upcoming matches found in database.", ephemeral=True)
+        return
+    
+    channel = bot.get_channel(MATCH_CHANNEL_ID)
+    if not channel:
+        await interaction.followup.send("Match channel not found!", ephemeral=True)
+        return
+    
+    reposted = 0
+    for match in matches:
+        match_id = match['match_id']
+        match_time = match['match_time']
+        if match_time.tzinfo is None:
+            match_time = match_time.replace(tzinfo=timezone.utc)
+        
+        kickoff_ts = int(match_time.timestamp())
+        home_team = match['home_team']
+        away_team = match['away_team']
+        competition = match['competition'] or 'Unknown'
+        
+        # Calculate countdown
+        time_until = match_time - now
+        days = time_until.days
+        hours = time_until.seconds // 3600
+        
+        if days > 0:
+            countdown = f"⏰ in {days} day{'s' if days != 1 else ''}"
+        elif hours > 0:
+            countdown = f"⏰ in ~{hours + (days * 24)} hours"
+        else:
+            mins = time_until.seconds // 60
+            countdown = f"⏰ in {mins} minutes"
+        
+        # Determine competition info
+        comp_info = {"flag": "🌍", "country": "International"}
+        for code, info in COMPETITION_INFO.items():
+            if info['name'] in competition:
+                comp_info = info
+                break
+        
+        embed = discord.Embed(
+            title=f"⚽ {home_team} vs {away_team}",
+            description=f"{comp_info['flag']} **{competition}**\n"
+                        f"🕐 Kickoff: <t:{kickoff_ts}:f>\n"
+                        f"{countdown}",
+            color=discord.Color.blue()
+        )
+        
+        embed.add_field(name="📊 Status", value="🟢 Upcoming", inline=True)
+        embed.add_field(name="🎯 Points", value="+1 for correct prediction", inline=True)
+        
+        voting_closes = match_time - timedelta(minutes=10)
+        voting_closes_ts = int(voting_closes.timestamp())
+        embed.add_field(name="🗳️ Voting", value=f"Closes <t:{voting_closes_ts}:R>", inline=True)
+        
+        time_to_vote = voting_closes - now
+        hours_to_vote = int(time_to_vote.total_seconds() // 3600)
+        embed.set_footer(text=f"⏳ Voting closes 10 minutes before kickoff • You have ~{hours_to_vote} hours to vote!")
+        
+        view = View()
+        view.add_item(VoteButton("🏠 Home", "home", match_id, kickoff_time=match_time))
+        view.add_item(VoteButton("🤝 Draw", "draw", match_id, kickoff_time=match_time))
+        view.add_item(VoteButton("✈️ Away", "away", match_id, kickoff_time=match_time))
+        
+        try:
+            match_message = await channel.send(embed=embed, view=view)
+            save_vote_message(match_id, match_message.id)
+            
+            # Get existing predictions
+            votes = get_predictions_for_match(match_id)
+            live_embed = create_live_predictions_embed(match_id, home_team, away_team)
+            live_message = await channel.send(embed=live_embed)
+            save_live_predictions_message(match_id, live_message.id)
+            
+            reposted += 1
+            await asyncio.sleep(1)
+        except Exception as e:
+            print(f"Failed to repost match {match_id}: {e}")
+    
+    await interaction.followup.send(f"Reposted {reposted} upcoming matches.", ephemeral=True)
 async def fixpoints_command(interaction: discord.Interaction):
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("Admin only", ephemeral=True)
