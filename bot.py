@@ -472,6 +472,73 @@ def create_live_predictions_embed(match_id, home_team, away_team, match_info=Non
         description = f"**{home_team}** vs **{away_team}**"
         color = discord.Color.green()
     
+    embed = discord.Embed(title=title, description=description, color=color) = f"**{home_team} {match_info['home_score']} - {match_info['away_score']} {away_team}**"
+        color = discord.Color.gold()
+    else:
+        title = "📊 Live Predictions"
+        description = f"**{home_team}** vs **{away_team}**"
+        color = discord.Color.green()
+    
+    embed = discord.Embed(title=title, description=description, color=color)
+    
+    # Add prediction summary at top
+    embed.add_field(
+        name="🔮 Prediction Summary",
+        value=f"**{total_votes}** prediction{'s' if total_votes != 1 else ''} made\n\u200b",
+        inline=False
+    )
+    
+    # Create consistent bars (20 chars max)
+    def make_bar(percentage):
+        filled = int(percentage / 5)  # 20 blocks = 100%
+        empty = 20 - filled
+        return "█" * filled + "░" * empty
+    
+    # Home predictions
+    home_bar = make_bar(home_pct)
+    home_users = ", ".join(sorted(votes['home'])) if votes['home'] else "_No predictions yet_"
+    embed.add_field(
+        name=f"\u200b",  # Empty name
+        value=f"🏠 **{home_team.upper()} WIN**\n"
+              f"`{home_bar}` **{home_pct:.0f}%** ({len(votes['home'])})\n"
+              f"{home_users}\n\u200b",
+        inline=False
+    )
+    
+    # Draw predictions
+    draw_bar = make_bar(draw_pct)
+    draw_users = ", ".join(sorted(votes['draw'])) if votes['draw'] else "_No predictions yet_"
+    embed.add_field(
+        name=f"\u200b",
+        value=f"🤝 **DRAW**\n"
+              f"`{draw_bar}` **{draw_pct:.0f}%** ({len(votes['draw'])})\n"
+              f"{draw_users}\n\u200b",
+        inline=False
+    )
+    
+    # Away predictions
+    away_bar = make_bar(away_pct)
+    away_users = ", ".join(sorted(votes['away'])) if votes['away'] else "_No predictions yet_"
+    embed.add_field(
+        name=f"\u200b",
+        value=f"✈️ **{away_team.upper()} WIN**\n"
+              f"`{away_bar}` **{away_pct:.0f}%** ({len(votes['away'])})\n"
+              f"{away_users}\n\u200b",
+        inline=False
+    )
+    
+    if match_info and match_info['status'] == 'FINISHED':
+        embed.set_footer(text="Match finished • Points awarded to correct predictions")
+    else:
+        embed.set_footer(text="Live tracking • Predictions update in real-time")
+    
+    return embed = f"**{home_team} {match_info['home_score']} - {match_info['away_score']} {away_team}**"
+        color = discord.Color.gold()
+    else:
+        title = "📊 Live Predictions"
+        description = f"**{home_team}** vs **{away_team}**"
+        color = discord.Color.green()
+    
     embed = discord.Embed(title=title, description=description, color=color)
     
     # Add prediction summary at top
@@ -1399,10 +1466,23 @@ async def matches_command(interaction: discord.Interaction):
         league_dict.setdefault(league_name, []).append(m)
     
     for league_name, league_matches in league_dict.items():
-        await interaction.channel.send(f"**{league_name}**")
+        # Post league separator
+        comp_code = league_matches[0]["competition"].get("code", "")
+        comp_info = COMPETITION_INFO.get(comp_code, {"flag": "🌍"})
+        
+        separator = discord.Embed(
+            title=f"{comp_info['flag']} {league_name}",
+            description=f"{len(league_matches)} upcoming match{'es' if len(league_matches) != 1 else ''}",
+            color=discord.Color.purple()
+        )
+        await interaction.channel.send(embed=separator)
+        
         for m in league_matches:
             await post_match(m)
-            await asyncio.sleep(0.5)  # Rate limiting
+            await asyncio.sleep(1)
+        
+        # Visual break between leagues
+        await interaction.channel.send("═" * 40)
     
     await interaction.followup.send("Posted upcoming matches!", ephemeral=True)
 
