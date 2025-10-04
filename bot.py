@@ -1204,6 +1204,26 @@ async def forcefetch_command(interaction: discord.Interaction):
     
     await interaction.followup.send(f"Found {len(upcoming)} matches. Posted {posted_count} new matches.", ephemeral=True)
 
+@bot.tree.command(name="backfillscores", description="[ADMIN] Fetch and save scores for processed matches")
+async def backfillscores_command(interaction: discord.Interaction):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("Admin only", ephemeral=True)
+        return
+    
+    await interaction.response.defer(ephemeral=True)
+    await interaction.followup.send("Fetching match results from API... This may take a minute.", ephemeral=True)
+    
+    results = await fetch_all_match_results()
+    updated = 0
+    
+    for match_id, result_data in results.items():
+        if result_data.get('home_score') is not None:
+            update_match_score(match_id, result_data['home_score'], 
+                             result_data['away_score'], 'FINISHED')
+            updated += 1
+    
+    await interaction.followup.send(f"Updated {updated} match scores from API.", ephemeral=True)
+
 @bot.tree.command(name="checkdb", description="[ADMIN] Check database status")
 async def checkdb_command(interaction: discord.Interaction):
     if not interaction.user.guild_permissions.administrator:
