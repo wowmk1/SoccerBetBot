@@ -793,6 +793,10 @@ async def post_match(match):
         live_message = await channel.send(embed=live_embed)
         save_live_predictions_message(match_id, live_message.id)
         
+        # Add thin separator after each match
+        separator_line = discord.Embed(description="───────────────────────────────", color=discord.Color.dark_gray())
+        await channel.send(embed=separator_line)
+        
         mark_match_posted(match_id, home_team, away_team, match_time, competition)
     except Exception as e:
         print(f"Failed to post match {match_id}: {e}")
@@ -1305,8 +1309,37 @@ async def repostmatches_command(interaction: discord.Interaction):
         await interaction.followup.send("Match channel not found!", ephemeral=True)
         return
     
-    reposted = 0
+    # Group matches by competition
+    matches_by_comp = {}
     for match in matches:
+        comp = match['competition'] or 'Unknown'
+        if comp not in matches_by_comp:
+            matches_by_comp[comp] = []
+        matches_by_comp[comp].append(match)
+    
+    reposted = 0
+    
+    # Post matches grouped by competition
+    for competition, comp_matches in matches_by_comp.items():
+        # Send competition header/separator
+        comp_info = {"flag": "🌍", "country": "International"}
+        for code, info in COMPETITION_INFO.items():
+            if info['name'] in competition:
+                comp_info = info
+                break
+        
+        separator_embed = discord.Embed(
+            title=f"{comp_info['flag']} {competition}",
+            description=f"**{len(comp_matches)}** upcoming match{'es' if len(comp_matches) != 1 else ''}",
+            color=discord.Color.dark_grey()
+        )
+        separator_embed.set_footer(text="─" * 50)
+        
+        await channel.send(embed=separator_embed)
+        await asyncio.sleep(0.5)
+        
+        # Post all matches in this competition
+        for match in comp_matches:
         match_id = match['match_id']
         match_time = match['match_time']
         if match_time.tzinfo is None:
@@ -1382,19 +1415,23 @@ async def repostmatches_command(interaction: discord.Interaction):
         view.add_item(VoteButton("🤝 Draw", "draw", match_id, kickoff_time=match_time))
         view.add_item(VoteButton("✈️ Away", "away", match_id, kickoff_time=match_time))
         
-        try:
-            match_message = await channel.send(embed=embed, file=file, view=view)
-            save_vote_message(match_id, match_message.id)
-            
-            # Post live predictions embed
-            live_embed = create_live_predictions_embed(match_id, home_team, away_team)
-            live_message = await channel.send(embed=live_embed)
-            save_live_predictions_message(match_id, live_message.id)
-            
-            reposted += 1
-            await asyncio.sleep(1)
-        except Exception as e:
-            print(f"Failed to repost match {match_id}: {e}")
+            try:
+                match_message = await channel.send(embed=embed, file=file, view=view)
+                save_vote_message(match_id, match_message.id)
+                
+                # Post live predictions embed
+                live_embed = create_live_predictions_embed(match_id, home_team, away_team)
+                live_message = await channel.send(embed=live_embed)
+                save_live_predictions_message(match_id, live_message.id)
+                
+                # Add thin separator between matches
+                separator_line = discord.Embed(description="───────────────────────────────", color=discord.Color.dark_gray())
+                await channel.send(embed=separator_line)
+                
+                reposted += 1
+                await asyncio.sleep(1)
+            except Exception as e:
+                print(f"Failed to repost match {match_id}: {e}")
     
     await interaction.followup.send(f"Reposted {reposted} upcoming matches with crests.", ephemeral=True)
 async def fixpoints_command(interaction: discord.Interaction):
@@ -1436,7 +1473,22 @@ async def matches_command(interaction: discord.Interaction):
         league_dict.setdefault(league_name, []).append(m)
     
     for league_name, league_matches in league_dict.items():
-        await interaction.channel.send(f"**{league_name}**")
+        # Get competition info
+        comp_code = league_matches[0]['competition'].get('code', '')
+        comp_info = COMPETITION_INFO.get(comp_code, {"flag": "🌍", "country": "International"})
+        
+        # Post competition separator
+        separator_embed = discord.Embed(
+            title=f"{comp_info['flag']} {league_name}",
+            description=f"**{len(league_matches)}** upcoming match{'es' if len(league_matches) != 1 else ''}",
+            color=discord.Color.dark_grey()
+        )
+        separator_embed.set_footer(text="─" * 50)
+        
+        await interaction.channel.send(embed=separator_embed)
+        await asyncio.sleep(0.5)
+        
+        # Post matches
         for m in league_matches:
             await post_match(m)
             await asyncio.sleep(0.5)  # Rate limiting
@@ -2397,4 +2449,5 @@ async def daily_fetch_matches():
 scheduler.add_job(lambda: bot.loop.create_task(daily_fetch_matches()), "cron", hour=6, minute=0)
 
 bot.run(DISCORD_BOT_TOKEN)
+
 
