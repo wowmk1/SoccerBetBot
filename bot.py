@@ -548,30 +548,42 @@ def create_live_predictions_embed(match_id, home_team, away_team, match_info=Non
         inline=False
     )
     
-    # Home predictions with bar
-    home_bar = "█" * int(home_pct / 5) if home_pct > 0 else "░"
+    # Create consistent bars (20 chars max)
+    def make_bar(percentage):
+        filled = int(percentage / 5)
+        empty = 20 - filled
+        return "█" * filled + "░" * empty
+    
+    # Home predictions
+    home_bar = make_bar(home_pct)
     home_users = ", ".join(sorted(votes['home'])) if votes['home'] else "_No predictions yet_"
     embed.add_field(
-        name=f"🏠 {home_team} Win",
-        value=f"`{home_bar}` **{home_pct:.0f}%** ({len(votes['home'])} votes)\n{home_users}",
+        name="\u200b",
+        value=f"🏠 **{home_team.upper()}**\n"
+              f"`{home_bar}` **{home_pct:.0f}%** ({len(votes['home'])} votes)\n"
+              f"{home_users}",
         inline=False
     )
     
-    # Draw predictions with bar
-    draw_bar = "█" * int(draw_pct / 5) if draw_pct > 0 else "░"
+    # Draw predictions
+    draw_bar = make_bar(draw_pct)
     draw_users = ", ".join(sorted(votes['draw'])) if votes['draw'] else "_No predictions yet_"
     embed.add_field(
-        name=f"🤝 Draw",
-        value=f"`{draw_bar}` **{draw_pct:.0f}%** ({len(votes['draw'])} votes)\n{draw_users}",
+        name="\u200b",
+        value=f"🤝 **DRAW**\n"
+              f"`{draw_bar}` **{draw_pct:.0f}%** ({len(votes['draw'])} votes)\n"
+              f"{draw_users}",
         inline=False
     )
     
-    # Away predictions with bar
-    away_bar = "█" * int(away_pct / 5) if away_pct > 0 else "░"
+    # Away predictions
+    away_bar = make_bar(away_pct)
     away_users = ", ".join(sorted(votes['away'])) if votes['away'] else "_No predictions yet_"
     embed.add_field(
-        name=f"✈️ {away_team} Win",
-        value=f"`{away_bar}` **{away_pct:.0f}%** ({len(votes['away'])} votes)\n{away_users}",
+        name="\u200b",
+        value=f"✈️ **{away_team.upper()}**\n"
+              f"`{away_bar}` **{away_pct:.0f}%** ({len(votes['away'])} votes)\n"
+              f"{away_users}",
         inline=False
     )
     
