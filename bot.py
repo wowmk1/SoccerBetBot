@@ -1434,9 +1434,6 @@ async def repostmatches_command(interaction: discord.Interaction):
                 print(f"Failed to repost match {match_id}: {e}")
     
     await interaction.followup.send(f"Reposted {reposted} upcoming matches with crests.", ephemeral=True)
-async def fixpoints_command(interaction: discord.Interaction):
-    if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("Admin only", ephemeral=True)
         return
     
     await interaction.response.defer(ephemeral=True)
@@ -1493,7 +1490,7 @@ async def matches_command(interaction: discord.Interaction):
             await post_match(m)
             await asyncio.sleep(0.5)  # Rate limiting
     
-    await interaction.followup.send("Posted upcoming matches!", ephemeral=True)
+    await interaction.followup.send("Posted upcoming matches!", ephemeral=True))
 
 @bot.tree.command(name="leaderboard", description="Show the leaderboard")
 async def leaderboard_command(interaction: discord.Interaction):
@@ -2449,5 +2446,3 @@ async def daily_fetch_matches():
 scheduler.add_job(lambda: bot.loop.create_task(daily_fetch_matches()), "cron", hour=6, minute=0)
 
 bot.run(DISCORD_BOT_TOKEN)
-
-
