@@ -1303,7 +1303,192 @@ async def leaderboard_command(interaction: discord.Interaction):
     
     await interaction.response.send_message(embed=embed)
 
-@bot.tree.command(name="ticket", description="Show your predictions")
+@bot.tree.command(name="ticket", description="Show your recent predictions summary")
+async def ticket_command(interaction: discord.Interaction, user: discord.Member = None):
+    await interaction.response.defer(ephemeral=True)
+    
+    target_user = user or interaction.user
+    user_id = str(target_user.id)
+    
+    user_data = get_user(user_id)
+    if not user_data:
+        await interaction.followup.send(f"{target_user.name} has no predictions yet.", ephemeral=True)
+        return
+    
+    stats = get_user_stats(user_id)
+    streaks = get_user_streaks(user_id)
+    
+    # Header embed with stats only
+    header_embed = discord.Embed(
+        title=f"🎫 {target_user.name}'s Prediction Ticket",
+        description="Quick summary of your predictions",
+        color=discord.Color.blue()
+    )
+    header_embed.set_thumbnail(url=target_user.display_avatar.url)
+    
+    # Stats summary
+    accuracy_bar = "█" * int(stats['accuracy'] / 5) if stats['accuracy'] > 0 else "░"
+    streak_emoji = "🔥" if streaks['current_streak'] >= 3 else "📈"
+    header_embed.add_field(
+        name="📊 Performance",
+        value=f"**Points:** {user_data['points']}\n"
+              f"**Accuracy:** `{accuracy_bar}` {stats['accuracy']:.1f}%\n"
+              f"{streak_emoji} **Streak:** {streaks['current_streak']}",
+        inline=True
+    )
+    header_embed.add_field(
+        name="🎯 Record",
+        value=f"**Correct:** {stats['correct']}\n"
+              f"**Total:** {stats['total']}\n"
+              f"**Best Streak:** {streaks['best_streak']}",
+        inline=True
+    )
+    
+    header_embed.add_field(
+        name="📋 View Details",
+        value="Use `/upcoming` to see future matches\nUse `/history` to see past results",
+        inline=False
+    )
+    
+    await interaction.followup.send(embed=header_embed, ephemeral=True)
+
+@bot.tree.command(name="upcoming", description="Show all your upcoming predictions")
+async def upcoming_command(interaction: discord.Interaction, user: discord.Member = None):
+    await interaction.response.defer(ephemeral=True)
+    
+    target_user = user or interaction.user
+    user_id = str(target_user.id)
+    
+    with db_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT p.match_id, p.prediction, pm.home_team, pm.away_team, pm.match_time,
+                   pm.competition, pm.status
+            FROM predictions p
+            LEFT JOIN posted_matches pm ON p.match_id = pm.match_id
+            WHERE p.user_id = %s
+            AND pm.status != 'FINISHED'
+            AND pm.match_time > NOW()
+            ORDER BY pm.match_time ASC
+        """, (user_id,))
+        predictions = cur.fetchall()
+    
+    if not predictions:
+        await interaction.followup.send("No upcoming predictions.", ephemeral=True)
+        return
+    
+    now = datetime.now(timezone.utc)
+    
+    # Split into multiple embeds (20 per embed to stay under limits)
+    for i in range(0, len(predictions), 20):
+        chunk = predictions[i:i+20]
+        embed = discord.Embed(
+            title=f"🔮 Upcoming Predictions ({i+1}-{min(i+20, len(predictions))} of {len(predictions)})",
+            color=discord.Color.blue()
+        )
+        
+        for pred in chunk:
+            match_time = pred['match_time']
+            if match_time.tzinfo is None:
+                match_time = match_time.replace(tzinfo=timezone.utc)
+            
+            time_until = match_time - now
+            if time_until.total_seconds() > 0:
+                status = f"⏰ <t:{int(match_time.timestamp())}:R>"
+            else:
+                status = "⚽ Live"
+            
+            pred_emoji = {"home": "🏠", "draw": "🤝", "away": "✈️"}.get(pred['prediction'], "🔮")
+            comp_short = pred['competition'][:20] if pred['competition'] else "Unknown"
+            
+            embed.add_field(
+                name=f"{pred['home_team']} vs {pred['away_team']}",
+                value=f"{pred_emoji} **{pred['prediction'].capitalize()}** • {comp_short}\n{status}",
+                inline=False
+            )
+        
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+@bot.tree.command(name="history", description="Show your recent match results")
+async def history_command(interaction: discord.Interaction, user: discord.Member = None, days: int = 7):
+    await interaction.response.defer(ephemeral=True)
+    
+    target_user = user or interaction.user
+    user_id = str(target_user.id)
+    
+    lookback = datetime.now(timezone.utc) - timedelta(days=days)
+    
+    with db_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT p.match_id, p.prediction, pm.home_team, pm.away_team, pm.match_time,
+                   pm.home_score, pm.away_score, pm.status, pm.competition
+            FROM predictions p
+            LEFT JOIN posted_matches pm ON p.match_id = pm.match_id
+            WHERE p.user_id = %s
+            AND pm.status = 'FINISHED'
+            AND pm.home_score IS NOT NULL
+            AND pm.match_time >= %s
+            ORDER BY pm.match_time DESC
+        """, (user_id, lookback))
+        predictions = cur.fetchall()
+    
+    if not predictions:
+        await interaction.followup.send(f"No finished matches in the last {days} days.", ephemeral=True)
+        return
+    
+    # Use cached results if available
+    global cache_timestamp
+    if not cache_timestamp or (datetime.now(timezone.utc) - cache_timestamp) > timedelta(minutes=10):
+        await fetch_all_match_results()
+    
+    # Split into multiple embeds (20 per embed)
+    total_correct = 0
+    for i in range(0, len(predictions), 20):
+        chunk = predictions[i:i+20]
+        embed = discord.Embed(
+            title=f"🏆 Match History ({i+1}-{min(i+20, len(predictions))} of {len(predictions)})",
+            description=f"Results from last {days} days",
+            color=discord.Color.gold()
+        )
+        
+        chunk_correct = 0
+        for pred in chunk:
+            # Determine actual result
+            if pred['home_score'] > pred['away_score']:
+                actual_result = 'home'
+            elif pred['away_score'] > pred['home_score']:
+                actual_result = 'away'
+            else:
+                actual_result = 'draw'
+            
+            is_correct = actual_result == pred['prediction']
+            if is_correct:
+                chunk_correct += 1
+                total_correct += 1
+            
+            result_emoji = "✅" if is_correct else "❌"
+            pred_emoji = {"home": "🏠", "draw": "🤝", "away": "✈️"}.get(pred['prediction'], "🔮")
+            
+            embed.add_field(
+                name=f"{result_emoji} {pred['home_team']} {pred['home_score']}-{pred['away_score']} {pred['away_team']}",
+                value=f"{pred_emoji} Predicted: **{pred['prediction'].capitalize()}**",
+                inline=False
+            )
+        
+        chunk_accuracy = (chunk_correct / len(chunk) * 100) if chunk else 0
+        embed.set_footer(text=f"This page: {chunk_correct}/{len(chunk)} ({chunk_accuracy:.0f}%)")
+        
+        await interaction.followup.send(embed=embed, ephemeral=True)
+    
+    # Send summary at the end
+    total_accuracy = (total_correct / len(predictions) * 100)
+    summary = discord.Embed(
+        title="📊 Summary",
+        description=f"**Overall:** {total_correct}/{len(predictions)} correct ({total_accuracy:.0f}%)",
+        color=discord.Color.green()
+    )
+    await interaction.followup.send(embed=summary, ephemeral=True)
 async def ticket_command(interaction: discord.Interaction, user: discord.Member = None):
     await interaction.response.defer(ephemeral=True)
     
