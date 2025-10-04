@@ -1283,6 +1283,23 @@ async def repostmatches_command(interaction: discord.Interaction):
         await interaction.followup.send("No upcoming matches found in database.", ephemeral=True)
         return
     
+    # Fetch fresh match data from API to get crests
+    await interaction.followup.send("Fetching match details from API...", ephemeral=True)
+    
+    api_matches = {}
+    async with aiohttp.ClientSession() as session:
+        for comp in COMPETITIONS:
+            url = f"{BASE_URL}{comp}/matches"
+            try:
+                async with session.get(url, headers=HEADERS, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        for m in data.get("matches", []):
+                            api_matches[str(m["id"])] = m
+                    await asyncio.sleep(1)  # Rate limiting
+            except Exception as e:
+                print(f"Error fetching {comp}: {e}")
+    
     channel = bot.get_channel(MATCH_CHANNEL_ID)
     if not channel:
         await interaction.followup.send("Match channel not found!", ephemeral=True)
@@ -1339,17 +1356,37 @@ async def repostmatches_command(interaction: discord.Interaction):
         hours_to_vote = int(time_to_vote.total_seconds() // 3600)
         embed.set_footer(text=f"⏳ Voting closes 10 minutes before kickoff • You have ~{hours_to_vote} hours to vote!")
         
+        # Try to get crests from API data
+        file = None
+        api_match = api_matches.get(match_id)
+        if api_match:
+            home_crest = api_match["homeTeam"].get("crest")
+            away_crest = api_match["awayTeam"].get("crest")
+            comp_emblem = api_match['competition'].get('emblem')
+            
+            # Set competition emblem as thumbnail
+            if comp_emblem:
+                embed.set_thumbnail(url=comp_emblem)
+            
+            # Generate team crests image
+            if home_crest or away_crest:
+                try:
+                    image_buffer = await generate_match_image(home_crest, away_crest)
+                    file = discord.File(fp=image_buffer, filename="match.png")
+                    embed.set_image(url="attachment://match.png")
+                except Exception as e:
+                    print(f"Failed to generate match image for {match_id}: {e}")
+        
         view = View()
         view.add_item(VoteButton("🏠 Home", "home", match_id, kickoff_time=match_time))
         view.add_item(VoteButton("🤝 Draw", "draw", match_id, kickoff_time=match_time))
         view.add_item(VoteButton("✈️ Away", "away", match_id, kickoff_time=match_time))
         
         try:
-            match_message = await channel.send(embed=embed, view=view)
+            match_message = await channel.send(embed=embed, file=file, view=view)
             save_vote_message(match_id, match_message.id)
             
-            # Get existing predictions
-            votes = get_predictions_for_match(match_id)
+            # Post live predictions embed
             live_embed = create_live_predictions_embed(match_id, home_team, away_team)
             live_message = await channel.send(embed=live_embed)
             save_live_predictions_message(match_id, live_message.id)
@@ -1359,7 +1396,7 @@ async def repostmatches_command(interaction: discord.Interaction):
         except Exception as e:
             print(f"Failed to repost match {match_id}: {e}")
     
-    await interaction.followup.send(f"Reposted {reposted} upcoming matches.", ephemeral=True)
+    await interaction.followup.send(f"Reposted {reposted} upcoming matches with crests.", ephemeral=True)
 async def fixpoints_command(interaction: discord.Interaction):
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("Admin only", ephemeral=True)
@@ -2360,3 +2397,4 @@ async def daily_fetch_matches():
 scheduler.add_job(lambda: bot.loop.create_task(daily_fetch_matches()), "cron", hour=6, minute=0)
 
 bot.run(DISCORD_BOT_TOKEN)
+
