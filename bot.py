@@ -432,6 +432,16 @@ def mark_match_processed(match_id):
         cur.execute("INSERT INTO processed_matches (match_id) VALUES (%s) ON CONFLICT DO NOTHING", (match_id,))
         conn.commit()
 
+# ==== COMPETITION INFO ====
+COMPETITION_INFO = {
+    "PL": {"name": "Premier League", "flag": "🏴󠁧󠁢󠁥󠁮󠁧󠁿", "country": "England"},
+    "CL": {"name": "Champions League", "flag": "🇪🇺", "country": "Europe"},
+    "BL1": {"name": "Bundesliga", "flag": "🇩🇪", "country": "Germany"},
+    "PD": {"name": "La Liga", "flag": "🇪🇸", "country": "Spain"},
+    "FL1": {"name": "Ligue 1", "flag": "🇫🇷", "country": "France"},
+    "SA": {"name": "Serie A", "flag": "🇮🇹", "country": "Italy"}
+}
+
 # ==== FOOTBALL API ====
 BASE_URL = "https://api.football-data.org/v4/competitions/"
 HEADERS = {"X-Auth-Token": FOOTBALL_DATA_API_KEY}
@@ -453,45 +463,55 @@ def create_live_predictions_embed(match_id, home_team, away_team, match_info=Non
         away_pct = (len(votes['away']) / total_votes) * 100
     
     # Check if match is finished and show score
-    title = "📊 Live Predictions"
-    description = f"**{home_team} vs {away_team}**\n🔮 {total_votes} predictions so far"
-    
     if match_info and match_info['status'] == 'FINISHED' and match_info['home_score'] is not None:
         title = "🏆 Final Result"
-        description = f"**{home_team} {match_info['home_score']} - {match_info['away_score']} {away_team}**\n🔮 {total_votes} predictions made"
+        description = f"**{home_team} {match_info['home_score']} - {match_info['away_score']} {away_team}**"
+        color = discord.Color.gold()
+    else:
+        title = "📊 Live Predictions"
+        description = f"**{home_team}** vs **{away_team}**"
+        color = discord.Color.green()
     
-    embed = discord.Embed(title=title, description=description, color=discord.Color.green())
+    embed = discord.Embed(title=title, description=description, color=color)
     
-    # Home predictions
-    home_users = ", ".join(sorted(votes['home'])) if votes['home'] else "No predictions"
+    # Add prediction summary at top
     embed.add_field(
-        name=f"🏠 {home_team} ({len(votes['home'])})",
-        value=home_users,
+        name="🔮 Prediction Summary",
+        value=f"**{total_votes}** prediction{'s' if total_votes != 1 else ''} made",
         inline=False
     )
     
-    # Draw predictions
-    draw_users = ", ".join(sorted(votes['draw'])) if votes['draw'] else "No predictions"
+    # Home predictions with bar
+    home_bar = "█" * int(home_pct / 5) if home_pct > 0 else "░"
+    home_users = ", ".join(sorted(votes['home'])) if votes['home'] else "_No predictions yet_"
     embed.add_field(
-        name=f"🤝 Draw ({len(votes['draw'])})",
-        value=draw_users,
+        name=f"🏠 {home_team} Win",
+        value=f"`{home_bar}` **{home_pct:.0f}%** ({len(votes['home'])} votes)\n{home_users}",
         inline=False
     )
     
-    # Away predictions
-    away_users = ", ".join(sorted(votes['away'])) if votes['away'] else "No predictions"
+    # Draw predictions with bar
+    draw_bar = "█" * int(draw_pct / 5) if draw_pct > 0 else "░"
+    draw_users = ", ".join(sorted(votes['draw'])) if votes['draw'] else "_No predictions yet_"
     embed.add_field(
-        name=f"✈️ {away_team} ({len(votes['away'])})",
-        value=away_users,
+        name=f"🤝 Draw",
+        value=f"`{draw_bar}` **{draw_pct:.0f}%** ({len(votes['draw'])} votes)\n{draw_users}",
         inline=False
     )
     
-    # Prediction breakdown
+    # Away predictions with bar
+    away_bar = "█" * int(away_pct / 5) if away_pct > 0 else "░"
+    away_users = ", ".join(sorted(votes['away'])) if votes['away'] else "_No predictions yet_"
     embed.add_field(
-        name="📈 Prediction Breakdown",
-        value=f"🏠 {home_pct:.0f}% • 🤝 {draw_pct:.0f}% • ✈️ {away_pct:.0f}%",
+        name=f"✈️ {away_team} Win",
+        value=f"`{away_bar}` **{away_pct:.0f}%** ({len(votes['away'])} votes)\n{away_users}",
         inline=False
     )
+    
+    if match_info and match_info['status'] == 'FINISHED':
+        embed.set_footer(text="Match finished • Points awarded to correct predictions")
+    else:
+        embed.set_footer(text="Live tracking • Predictions update in real-time")
     
     return embed
 
@@ -688,12 +708,65 @@ async def post_match(match):
     home_team = match['homeTeam']['name']
     away_team = match['awayTeam']['name']
     competition = match['competition'].get('name', 'Unknown')
+    comp_code = match['competition'].get('code', '')
+    
+    # Get competition info
+    comp_info = COMPETITION_INFO.get(comp_code, {"flag": "🌍", "country": "International"})
+    
+    # Calculate time until kickoff
+    now = datetime.now(timezone.utc)
+    time_until = match_time - now
+    days = time_until.days
+    hours = time_until.seconds // 3600
+    
+    if days > 0:
+        countdown = f"⏰ in {days} day{'s' if days != 1 else ''}"
+    elif hours > 0:
+        countdown = f"⏰ in ~{hours + (days * 24)} hours"
+    else:
+        mins = time_until.seconds // 60
+        countdown = f"⏰ in {mins} minutes"
     
     embed = discord.Embed(
-        title=f"{home_team} vs {away_team}",
-        description=f"**{competition}**\nKickoff: <t:{kickoff_ts}:f>",
+        title=f"⚽ {home_team} vs {away_team}",
+        description=f"{comp_info['flag']} **{competition}**\n"
+                    f"🕐 Kickoff: <t:{kickoff_ts}:f>\n"
+                    f"{countdown}",
         color=discord.Color.blue()
     )
+    
+    # Add status field
+    embed.add_field(
+        name="📊 Status",
+        value="🟢 Upcoming",
+        inline=True
+    )
+    
+    # Add points info
+    embed.add_field(
+        name="🎯 Points",
+        value="+1 for correct prediction",
+        inline=True
+    )
+    
+    # Add voting window info
+    voting_closes = match_time - timedelta(minutes=10)
+    voting_closes_ts = int(voting_closes.timestamp())
+    embed.add_field(
+        name="🗳️ Voting",
+        value=f"Closes <t:{voting_closes_ts}:R>",
+        inline=True
+    )
+    
+    # Add competition emblem if available
+    comp_emblem = match['competition'].get('emblem')
+    if comp_emblem:
+        embed.set_thumbnail(url=comp_emblem)
+    
+    # Footer with reminder
+    time_to_vote = voting_closes - now
+    hours_to_vote = int(time_to_vote.total_seconds() // 3600)
+    embed.set_footer(text=f"⏳ Voting closes 10 minutes before kickoff • You have ~{hours_to_vote} hours to vote!")
     
     home_crest = match["homeTeam"].get("crest")
     away_crest = match["awayTeam"].get("crest")
@@ -707,9 +780,9 @@ async def post_match(match):
             print(f"Failed to generate match image: {e}")
     
     view = View()
-    view.add_item(VoteButton("Home", "home", match_id, kickoff_time=match_time))
-    view.add_item(VoteButton("Draw", "draw", match_id, kickoff_time=match_time))
-    view.add_item(VoteButton("Away", "away", match_id, kickoff_time=match_time))
+    view.add_item(VoteButton("🏠 Home", "home", match_id, kickoff_time=match_time))
+    view.add_item(VoteButton("🤝 Draw", "draw", match_id, kickoff_time=match_time))
+    view.add_item(VoteButton("✈️ Away", "away", match_id, kickoff_time=match_time))
     
     try:
         match_message = await channel.send(embed=embed, file=file, view=view)
@@ -1194,26 +1267,208 @@ async def leaderboard_command(interaction: discord.Interaction):
             prediction_counts[entry['user_id']] = cur.fetchone()['count']
     
     # Medal emojis
-    medals = ["🥇", "🥈", "🥉", "4.", "5."]
+    medals = ["🥇", "🥈", "🥉"]
     
-    embed = discord.Embed(title="🏆 Prediction Leaderboard", color=discord.Color.gold())
+    embed = discord.Embed(
+        title="🏆 Prediction Leaderboard",
+        description="Top predictors of the season",
+        color=discord.Color.gold()
+    )
     
-    desc_lines = []
-    for i, entry in enumerate(leaderboard[:5]):
-        medal = medals[i] if i < len(medals) else f"{i+1}."
+    # Top 3 with medals
+    top_3 = []
+    for i, entry in enumerate(leaderboard[:3]):
         pred_count = prediction_counts.get(entry['user_id'], 0)
-        desc_lines.append(f"{medal} **{entry['username']}** — **{entry['points']} pts** *({pred_count} predictions)*")
+        accuracy = (entry['points'] / pred_count * 100) if pred_count > 0 else 0
+        streaks = get_user_streaks(entry['user_id'])
+        streak_text = f" 🔥{streaks['current_streak']}" if streaks['current_streak'] >= 3 else ""
+        top_3.append(f"{medals[i]} **{entry['username']}**{streak_text}\n**{entry['points']} pts** • {accuracy:.0f}% accuracy • {pred_count} predictions")
     
-    embed.description = "\n".join(desc_lines)
+    embed.add_field(name="👑 Top 3", value="\n\n".join(top_3), inline=False)
+    
+    # Rest of top 10
+    if len(leaderboard) > 3:
+        rest = []
+        for i, entry in enumerate(leaderboard[3:10], start=4):
+            pred_count = prediction_counts.get(entry['user_id'], 0)
+            rest.append(f"`{i}.` **{entry['username']}** • {entry['points']} pts")
+        
+        if rest:
+            embed.add_field(name="📊 Rankings", value="\n".join(rest), inline=False)
     
     # Footer
     total_players = len(leaderboard)
     total_predictions = sum(prediction_counts.values())
-    embed.set_footer(text=f"{total_players} players • 🎯 {total_predictions} total predictions")
+    embed.set_footer(text=f"{total_players} active players • {total_predictions} total predictions made")
     
     await interaction.response.send_message(embed=embed)
 
 @bot.tree.command(name="ticket", description="Show your predictions")
+async def ticket_command(interaction: discord.Interaction, user: discord.Member = None):
+    await interaction.response.defer(ephemeral=True)
+    
+    target_user = user or interaction.user
+    user_id = str(target_user.id)
+    
+    user_data = get_user(user_id)
+    if not user_data:
+        await interaction.followup.send(f"{target_user.name} has no predictions yet.", ephemeral=True)
+        return
+    
+    stats = get_user_stats(user_id)
+    streaks = get_user_streaks(user_id)
+    
+    # Get all user predictions with match info
+    with db_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT p.match_id, p.prediction, pm.home_team, pm.away_team, pm.match_time,
+                   pm.home_score, pm.away_score, pm.status, pm.competition,
+                   CASE WHEN proc.match_id IS NOT NULL THEN TRUE ELSE FALSE END as is_processed
+            FROM predictions p
+            LEFT JOIN posted_matches pm ON p.match_id = pm.match_id
+            LEFT JOIN processed_matches proc ON p.match_id = proc.match_id
+            WHERE p.user_id = %s
+            ORDER BY pm.match_time DESC NULLS LAST
+        """, (user_id,))
+        predictions = cur.fetchall()
+    
+    if not predictions:
+        await interaction.followup.send(f"{target_user.name} has no predictions yet.", ephemeral=True)
+        return
+    
+    # Use cached results if available
+    global cache_timestamp
+    if not cache_timestamp or (datetime.now(timezone.utc) - cache_timestamp) > timedelta(minutes=10):
+        await fetch_all_match_results()
+    
+    embeds = []
+    
+    # Header embed with stats
+    header_embed = discord.Embed(
+        title=f"🎫 {target_user.name}'s Prediction Ticket",
+        description="Complete prediction history and performance",
+        color=discord.Color.blue()
+    )
+    header_embed.set_thumbnail(url=target_user.display_avatar.url)
+    
+    # Stats summary
+    accuracy_bar = "█" * int(stats['accuracy'] / 5) if stats['accuracy'] > 0 else "░"
+    streak_emoji = "🔥" if streaks['current_streak'] >= 3 else "📈"
+    header_embed.add_field(
+        name="📊 Performance",
+        value=f"**Points:** {user_data['points']}\n"
+              f"**Accuracy:** `{accuracy_bar}` {stats['accuracy']:.1f}%\n"
+              f"{streak_emoji} **Streak:** {streaks['current_streak']}",
+        inline=True
+    )
+    header_embed.add_field(
+        name="🎯 Record",
+        value=f"**Correct:** {stats['correct']}\n"
+              f"**Total:** {stats['total']}\n"
+              f"**Best Streak:** {streaks['best_streak']}",
+        inline=True
+    )
+    
+    embeds.append(header_embed)
+    
+    # Separate upcoming and finished
+    upcoming_predictions = []
+    finished_predictions = []
+    now = datetime.now(timezone.utc)
+    two_days_ago = now - timedelta(days=2)
+    
+    for pred in predictions:
+        if not pred['match_time']:
+            continue
+        
+        match_time = pred['match_time']
+        if match_time.tzinfo is None:
+            match_time = match_time.replace(tzinfo=timezone.utc)
+        
+        if match_time < two_days_ago:
+            continue
+        
+        if pred['status'] == 'FINISHED' and pred['home_score'] is not None:
+            finished_predictions.append(pred)
+        else:
+            upcoming_predictions.append(pred)
+    
+    # Upcoming matches embed
+    if upcoming_predictions:
+        upcoming_embed = discord.Embed(
+            title="🔮 Upcoming Predictions",
+            description=f"{len(upcoming_predictions)} match{'es' if len(upcoming_predictions) != 1 else ''} awaiting results",
+            color=discord.Color.blue()
+        )
+        
+        for pred in upcoming_predictions[:10]:
+            match_time = pred['match_time']
+            if match_time.tzinfo is None:
+                match_time = match_time.replace(tzinfo=timezone.utc)
+            
+            time_until = match_time - now
+            if time_until.total_seconds() > 0:
+                status = f"⏰ <t:{int(match_time.timestamp())}:R>"
+            else:
+                status = "⚽ Live"
+            
+            pred_emoji = {"home": "🏠", "draw": "🤝", "away": "✈️"}.get(pred['prediction'], "🔮")
+            comp_short = pred['competition'][:20] if pred['competition'] else "Unknown"
+            
+            upcoming_embed.add_field(
+                name=f"{pred['home_team']} vs {pred['away_team']}",
+                value=f"{pred_emoji} **{pred['prediction'].capitalize()}** • {comp_short}\n{status}",
+                inline=False
+            )
+        
+        embeds.append(upcoming_embed)
+    
+    # Finished matches embed
+    if finished_predictions:
+        finished_embed = discord.Embed(
+            title="🏆 Recent Results",
+            description=f"Last {min(len(finished_predictions), 10)} completed matches",
+            color=discord.Color.gold()
+        )
+        
+        correct_count = 0
+        for pred in finished_predictions[:10]:
+            # Determine actual result
+            if pred['home_score'] > pred['away_score']:
+                actual_result = 'home'
+            elif pred['away_score'] > pred['home_score']:
+                actual_result = 'away'
+            else:
+                actual_result = 'draw'
+            
+            is_correct = actual_result == pred['prediction']
+            if is_correct:
+                correct_count += 1
+            
+            result_emoji = "✅" if is_correct else "❌"
+            pred_emoji = {"home": "🏠", "draw": "🤝", "away": "✈️"}.get(pred['prediction'], "🔮")
+            score = f"**{pred['home_score']}-{pred['away_score']}**"
+            
+            finished_embed.add_field(
+                name=f"{result_emoji} {pred['home_team']} {pred['home_score']}-{pred['away_score']} {pred['away_team']}",
+                value=f"{pred_emoji} Predicted: **{pred['prediction'].capitalize()}**",
+                inline=False
+            )
+        
+        recent_accuracy = (correct_count / len(finished_predictions[:10]) * 100) if finished_predictions else 0
+        finished_embed.set_footer(text=f"Recent form: {correct_count}/{min(len(finished_predictions), 10)} ({recent_accuracy:.0f}%)")
+        embeds.append(finished_embed)
+    
+    if len(embeds) == 1:
+        embeds[0].add_field(
+            name="📭 No Recent Activity",
+            value="No predictions in the last 2 days",
+            inline=False
+        )
+    
+    for embed in embeds:
+        await interaction.followup.send(embed=embed, ephemeral=True)
 async def ticket_command(interaction: discord.Interaction, user: discord.Member = None):
     await interaction.response.defer(ephemeral=True)
     
@@ -1386,32 +1641,50 @@ async def mystats_command(interaction: discord.Interaction):
     
     embed = discord.Embed(
         title=f"📊 {interaction.user.name}'s Statistics",
+        description="Your prediction performance summary",
         color=discord.Color.blue()
     )
     
-    # Overall stats
+    # Set user avatar
+    embed.set_thumbnail(url=interaction.user.display_avatar.url)
+    
+    # Overall stats with visual bars
+    accuracy_bar = "█" * int(stats['accuracy'] / 5) if stats['accuracy'] > 0 else "░"
     embed.add_field(
-        name="🎯 Overall",
+        name="🎯 Overall Performance",
         value=f"**Points:** {user_data['points']}\n"
-              f"**Total Predictions:** {stats['total']}\n"
+              f"**Predictions:** {stats['total']}\n"
               f"**Correct:** {stats['correct']}\n"
-              f"**Accuracy:** {stats['accuracy']:.1f}%",
+              f"**Accuracy:** `{accuracy_bar}` {stats['accuracy']:.1f}%",
         inline=False
     )
     
-    # Streaks
+    # Streaks with fire emoji
     streak_emoji = "🔥" if streaks['current_streak'] >= 3 else "📈"
+    streak_display = f"**{streaks['current_streak']}**" if streaks['current_streak'] >= 3 else streaks['current_streak']
     embed.add_field(
         name=f"{streak_emoji} Streaks",
-        value=f"**Current Streak:** {streaks['current_streak']}\n"
-              f"**Best Streak:** {streaks['best_streak']}",
-        inline=False
+        value=f"**Current:** {streak_display}\n"
+              f"**Best:** {streaks['best_streak']}",
+        inline=True
     )
+    
+    # Leaderboard position
+    leaderboard = get_leaderboard()
+    position = next((i+1 for i, entry in enumerate(leaderboard) if entry['user_id'] == user_id), None)
+    
+    if position:
+        rank_emoji = "👑" if position == 1 else "🏅" if position <= 3 else "📊"
+        embed.add_field(
+            name=f"{rank_emoji} Rank",
+            value=f"**#{position}** of {len(leaderboard)}",
+            inline=True
+        )
     
     # Competition breakdown
     if comp_breakdown:
         comp_text = []
-        for comp in comp_breakdown[:5]:  # Top 5 competitions
+        for comp in comp_breakdown[:5]:
             comp_text.append(f"**{comp['competition']}:** {comp['total']} predictions")
         
         embed.add_field(
@@ -1420,16 +1693,7 @@ async def mystats_command(interaction: discord.Interaction):
             inline=False
         )
     
-    # Leaderboard position
-    leaderboard = get_leaderboard()
-    position = next((i+1 for i, entry in enumerate(leaderboard) if entry['user_id'] == user_id), None)
-    
-    if position:
-        embed.add_field(
-            name="🏅 Rank",
-            value=f"#{position} out of {len(leaderboard)} players",
-            inline=False
-        )
+    embed.set_footer(text="Keep predicting to climb the leaderboard!")
     
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
