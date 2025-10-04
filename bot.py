@@ -1426,7 +1426,6 @@ async def history_command(interaction: discord.Interaction, user: discord.Member
             FROM predictions p
             LEFT JOIN posted_matches pm ON p.match_id = pm.match_id
             WHERE p.user_id = %s
-            AND pm.status = 'FINISHED'
             AND pm.home_score IS NOT NULL
             AND pm.match_time >= %s
             ORDER BY pm.match_time DESC
