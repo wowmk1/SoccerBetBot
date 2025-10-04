@@ -902,12 +902,19 @@ async def update_match_results():
                 channel = bot.get_channel(MATCH_CHANNEL_ID)
                 votes_message = await channel.fetch_message(vote_msg['votes_msg_id'])
                 
-                # Disable buttons
-                new_view = View()
-                for item in votes_message.components[0].children:
-                    item.disabled = True
-                    new_view.add_item(item)
-                await votes_message.edit(view=new_view)
+                # Create disabled view with NEW buttons
+                disabled_view = View(timeout=None)
+                home_btn = Button(label="🏠 Home", style=discord.ButtonStyle.secondary, disabled=True)
+                draw_btn = Button(label="🤝 Draw", style=discord.ButtonStyle.secondary, disabled=True)
+                away_btn = Button(label="✈️ Away", style=discord.ButtonStyle.secondary, disabled=True)
+                
+                disabled_view.add_item(home_btn)
+                disabled_view.add_item(draw_btn)
+                disabled_view.add_item(away_btn)
+                
+                await votes_message.edit(view=disabled_view)
+                disable_vote_buttons(match_id)
+            except discord.errors.NotFound:
                 disable_vote_buttons(match_id)
             except Exception as e:
                 print(f"Failed to update vote buttons for {match_id}: {e}")
@@ -936,13 +943,80 @@ async def update_match_results():
             return
         
         leaderboard = get_leaderboard()
-        desc_lines = []
-        for i, entry in enumerate(leaderboard[:10]):
-            diff = entry['points'] - previous_points.get(entry['user_id'], 0)
-            suffix = f" (+{diff})" if diff > 0 else ""
-            desc_lines.append(f"**{i+1}. {entry['username']}** — {entry['points']} pts{suffix}")
-        desc = "\n".join(desc_lines)
-        embed = discord.Embed(title="Leaderboard", description=desc, color=discord.Color.gold())
+        
+        # Create enhanced leaderboard embed
+        embed = discord.Embed(
+            title="🏆 Prediction Leaderboard",
+            description="Live rankings updated after each match",
+            color=discord.Color.gold()
+        )
+        
+        # Top 3 with special formatting
+        if len(leaderboard) >= 1:
+            medals = ["🥇", "🥈", "🥉"]
+            top_3_lines = []
+            
+            for i in range(min(3, len(leaderboard))):
+                entry = leaderboard[i]
+                diff = entry['points'] - previous_points.get(entry['user_id'], 0)
+                
+                # Get user stats
+                with db_connection() as conn:
+                    cur = conn.cursor()
+                    cur.execute("SELECT COUNT(*) as total FROM predictions WHERE user_id = %s", (entry['user_id'],))
+                    total_preds = cur.fetchone()['total']
+                
+                accuracy = (entry['points'] / total_preds * 100) if total_preds > 0 else 0
+                
+                # Show point gain
+                gain_text = f" `+{diff}`" if diff > 0 else ""
+                
+                # Get streak
+                streaks = get_user_streaks(entry['user_id'])
+                streak_text = f" 🔥 {streaks['current_streak']}" if streaks['current_streak'] >= 3 else ""
+                
+                top_3_lines.append(
+                    f"{medals[i]} **{entry['username']}**{gain_text}{streak_text}\n"
+                    f"└ {entry['points']} pts • {accuracy:.0f}% accuracy"
+                )
+            
+            embed.add_field(
+                name="👑 Top 3",
+                value="\n\n".join(top_3_lines),
+                inline=False
+            )
+        
+        # Rest of top 10
+        if len(leaderboard) > 3:
+            rest_lines = []
+            for i in range(3, min(10, len(leaderboard))):
+                entry = leaderboard[i]
+                diff = entry['points'] - previous_points.get(entry['user_id'], 0)
+                gain_text = f" `+{diff}`" if diff > 0 else ""
+                rest_lines.append(f"`{i+1}.` **{entry['username']}** • {entry['points']} pts{gain_text}")
+            
+            if rest_lines:
+                embed.add_field(
+                    name="📊 Rankings",
+                    value="\n".join(rest_lines),
+                    inline=False
+                )
+        
+        # Stats footer
+        total_players = len(leaderboard)
+        total_points_awarded = sum(e['points'] for e in leaderboard)
+        
+        with db_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT COUNT(*) as total FROM predictions")
+            total_predictions = cur.fetchone()['total']
+        
+        embed.set_footer(
+            text=f"👥 {total_players} players • 🎯 {total_predictions} predictions • 🏅 {total_points_awarded} points awarded"
+        )
+        
+        # Add timestamp
+        embed.timestamp = datetime.now(timezone.utc)
         
         try:
             if last_leaderboard_msg_id:
@@ -1027,6 +1101,53 @@ async def send_match_notifications():
                 print(f"Failed to send notification: {e}")
         
         mark_notification_sent(match['match_id'])
+
+# ==== DISABLE BUTTONS AT KICKOFF ====
+@tasks.loop(minutes=2)
+async def disable_buttons_at_kickoff():
+    """Disable voting buttons for matches that have started"""
+    now = datetime.now(timezone.utc)
+    
+    with db_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT vd.match_id, vd.votes_msg_id, pm.home_team, pm.away_team
+            FROM vote_data vd
+            JOIN posted_matches pm ON vd.match_id = pm.match_id
+            WHERE pm.match_time <= %s
+            AND pm.match_time > %s
+            AND vd.buttons_disabled = FALSE
+            AND pm.status != 'FINISHED'
+        """, (now, now - timedelta(minutes=5)))
+        matches = cur.fetchall()
+    
+    if not matches:
+        return
+    
+    channel = bot.get_channel(MATCH_CHANNEL_ID)
+    if not channel:
+        return
+    
+    for match in matches:
+        try:
+            votes_message = await channel.fetch_message(match['votes_msg_id'])
+            
+            disabled_view = View(timeout=None)
+            home_btn = Button(label="🏠 Home", style=discord.ButtonStyle.secondary, disabled=True)
+            draw_btn = Button(label="🤝 Draw", style=discord.ButtonStyle.secondary, disabled=True)
+            away_btn = Button(label="✈️ Away", style=discord.ButtonStyle.secondary, disabled=True)
+            
+            disabled_view.add_item(home_btn)
+            disabled_view.add_item(draw_btn)
+            disabled_view.add_item(away_btn)
+            
+            await votes_message.edit(view=disabled_view)
+            disable_vote_buttons(match['match_id'])
+            print(f"Disabled buttons for started match: {match['home_team']} vs {match['away_team']}")
+        except discord.errors.NotFound:
+            disable_vote_buttons(match['match_id'])
+        except Exception as e:
+            print(f"Failed to disable buttons for {match['match_id']}: {e}")
 
 # ==== WEEKLY RECAP ====
 @tasks.loop(hours=24)
@@ -1600,50 +1721,98 @@ async def upcoming_command(interaction: discord.Interaction, user: discord.Membe
         cur = conn.cursor()
         cur.execute("""
             SELECT p.match_id, p.prediction, pm.home_team, pm.away_team, pm.match_time,
-                   pm.competition, pm.status
+                   pm.competition, pm.status, pm.home_score, pm.away_score
             FROM predictions p
             LEFT JOIN posted_matches pm ON p.match_id = pm.match_id
             WHERE p.user_id = %s
             AND pm.status != 'FINISHED'
-            AND pm.match_time > NOW()
             ORDER BY pm.match_time ASC
         """, (user_id,))
         predictions = cur.fetchall()
     
     if not predictions:
-        await interaction.followup.send("No upcoming predictions.", ephemeral=True)
+        await interaction.followup.send("No upcoming or ongoing predictions.", ephemeral=True)
         return
     
     now = datetime.now(timezone.utc)
     
-    # Split into multiple embeds (20 per embed to stay under limits)
-    for i in range(0, len(predictions), 20):
-        chunk = predictions[i:i+20]
-        embed = discord.Embed(
-            title=f"🔮 Upcoming Predictions ({i+1}-{min(i+20, len(predictions))} of {len(predictions)})",
-            color=discord.Color.blue()
-        )
-        
-        for pred in chunk:
+    # Separate into ongoing and upcoming
+    ongoing = []
+    upcoming = []
+    
+    for pred in predictions:
+        if pred['match_time']:
             match_time = pred['match_time']
             if match_time.tzinfo is None:
                 match_time = match_time.replace(tzinfo=timezone.utc)
             
-            time_until = match_time - now
-            if time_until.total_seconds() > 0:
-                status = f"⏰ <t:{int(match_time.timestamp())}:R>"
+            if match_time <= now:
+                ongoing.append(pred)
             else:
-                status = "⚽ Live"
-            
+                upcoming.append(pred)
+    
+    # Create embeds
+    embeds_to_send = []
+    
+    # Ongoing matches embed
+    if ongoing:
+        ongoing_embed = discord.Embed(
+            title="⚽ Live Matches",
+            description=f"{len(ongoing)} match{'es' if len(ongoing) != 1 else ''} in progress",
+            color=discord.Color.red()
+        )
+        
+        for pred in ongoing[:15]:  # Limit to 15
             pred_emoji = {"home": "🏠", "draw": "🤝", "away": "✈️"}.get(pred['prediction'], "🔮")
             comp_short = pred['competition'][:20] if pred['competition'] else "Unknown"
             
-            embed.add_field(
-                name=f"{pred['home_team']} vs {pred['away_team']}",
-                value=f"{pred_emoji} **{pred['prediction'].capitalize()}** • {comp_short}\n{status}",
+            # Show live score if available
+            if pred['home_score'] is not None and pred['away_score'] is not None:
+                score_text = f"**{pred['home_score']}-{pred['away_score']}** (Live)"
+            else:
+                score_text = "In Progress"
+            
+            ongoing_embed.add_field(
+                name=f"🔴 {pred['home_team']} vs {pred['away_team']}",
+                value=f"{pred_emoji} Predicted: **{pred['prediction'].capitalize()}** • {comp_short}\n{score_text}",
                 inline=False
             )
         
+        embeds_to_send.append(ongoing_embed)
+    
+    # Upcoming matches embed
+    if upcoming:
+        for i in range(0, len(upcoming), 20):
+            chunk = upcoming[i:i+20]
+            upcoming_embed = discord.Embed(
+                title=f"🔮 Upcoming Predictions ({i+1}-{min(i+20, len(upcoming))} of {len(upcoming)})",
+                color=discord.Color.blue()
+            )
+            
+            for pred in chunk:
+                match_time = pred['match_time']
+                if match_time.tzinfo is None:
+                    match_time = match_time.replace(tzinfo=timezone.utc)
+                
+                time_until = match_time - now
+                if time_until.total_seconds() > 0:
+                    status = f"⏰ <t:{int(match_time.timestamp())}:R>"
+                else:
+                    status = "Starting soon"
+                
+                pred_emoji = {"home": "🏠", "draw": "🤝", "away": "✈️"}.get(pred['prediction'], "🔮")
+                comp_short = pred['competition'][:20] if pred['competition'] else "Unknown"
+                
+                upcoming_embed.add_field(
+                    name=f"{pred['home_team']} vs {pred['away_team']}",
+                    value=f"{pred_emoji} **{pred['prediction'].capitalize()}** • {comp_short}\n{status}",
+                    inline=False
+                )
+            
+            embeds_to_send.append(upcoming_embed)
+    
+    # Send all embeds
+    for embed in embeds_to_send:
         await interaction.followup.send(embed=embed, ephemeral=True)
 
 @bot.tree.command(name="history", description="Show your recent match results")
@@ -1968,7 +2137,6 @@ async def compare_command(interaction: discord.Interaction, user: discord.Member
 async def on_ready():
     init_db()
     
-    # Add persistent view - this is CRITICAL for persistent buttons to work
     bot.add_view(PersistentVoteView())
     
     await bot.tree.sync()
@@ -1976,6 +2144,7 @@ async def on_ready():
     update_match_results.start()
     send_match_notifications.start()
     weekly_recap.start()
+    disable_buttons_at_kickoff.start()  # ADD THIS LINE
     scheduler.start()
     print(f"Logged in as {bot.user}")
 
@@ -1991,5 +2160,6 @@ async def daily_fetch_matches():
 scheduler.add_job(lambda: bot.loop.create_task(daily_fetch_matches()), "cron", hour=6, minute=0)
 
 bot.run(DISCORD_BOT_TOKEN)
+
 
 
