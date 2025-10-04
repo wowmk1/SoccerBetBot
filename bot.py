@@ -1376,7 +1376,7 @@ async def ticket_command(interaction: discord.Interaction, user: discord.Member 
     upcoming_predictions = []
     finished_predictions = []
     now = datetime.now(timezone.utc)
-    two_days_ago = now - timedelta(days=2)
+    seven_days_ago = now - timedelta(days=7)  # Show last 7 days
     
     for pred in predictions:
         if not pred['match_time']:
@@ -1386,7 +1386,8 @@ async def ticket_command(interaction: discord.Interaction, user: discord.Member 
         if match_time.tzinfo is None:
             match_time = match_time.replace(tzinfo=timezone.utc)
         
-        if match_time < two_days_ago:
+        # Show last 7 days + all future matches
+        if match_time < seven_days_ago:
             continue
         
         if pred['status'] == 'FINISHED' and pred['home_score'] is not None:
@@ -1398,11 +1399,12 @@ async def ticket_command(interaction: discord.Interaction, user: discord.Member 
     if upcoming_predictions:
         upcoming_embed = discord.Embed(
             title="🔮 Upcoming Predictions",
-            description=f"{len(upcoming_predictions)} match{'es' if len(upcoming_predictions) != 1 else ''} awaiting results",
+            description=f"{len(upcoming_predictions)} match{'es' if len(upcoming_predictions) != 1 else ''} awaiting results" + 
+                       (f" (showing first 15)" if len(upcoming_predictions) > 15 else ""),
             color=discord.Color.blue()
         )
         
-        for pred in upcoming_predictions[:10]:
+        for pred in upcoming_predictions[:15]:  # Limit to 15
             match_time = pred['match_time']
             if match_time.tzinfo is None:
                 match_time = match_time.replace(tzinfo=timezone.utc)
@@ -1428,12 +1430,13 @@ async def ticket_command(interaction: discord.Interaction, user: discord.Member 
     if finished_predictions:
         finished_embed = discord.Embed(
             title="🏆 Recent Results",
-            description=f"Last {min(len(finished_predictions), 10)} completed matches",
+            description=f"Last {min(len(finished_predictions), 15)} completed matches" +
+                       (f" (total: {len(finished_predictions)})" if len(finished_predictions) > 15 else ""),
             color=discord.Color.gold()
         )
         
         correct_count = 0
-        for pred in finished_predictions[:10]:
+        for pred in finished_predictions[:15]:  # Limit to 15
             # Determine actual result
             if pred['home_score'] > pred['away_score']:
                 actual_result = 'home'
