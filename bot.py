@@ -472,6 +472,13 @@ def create_live_predictions_embed(match_id, home_team, away_team, match_info=Non
         description = f"**{home_team}** vs **{away_team}**"
         color = discord.Color.green()
     
+    embed = discord.Embed(title=title, description=description, color=color) = f"**{home_team} {match_info['home_score']} - {match_info['away_score']} {away_team}**"
+        color = discord.Color.gold()
+    else:
+        title = "📊 Live Predictions"
+        description = f"**{home_team}** vs **{away_team}**"
+        color = discord.Color.green()
+    
     embed = discord.Embed(title=title, description=description, color=color)
     
     # Add prediction summary at top
