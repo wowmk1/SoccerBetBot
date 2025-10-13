@@ -1294,309 +1294,299 @@ async def weekly_recap():
 async def before_weekly_recap():
     await bot.wait_until_ready()
 
-# ==== ADMIN COMMAND GROUP ====
-admin_group = app_commands.Group(
-    name="admin", 
-    description="Admin commands",
-    default_permissions=discord.Permissions(administrator=True)
+# ==== ADMIN COMMANDS ====
+@bot.tree.command(name="admin", description="Admin commands")
+@app_commands.describe(
+    action="Admin action to perform",
+    user="Target user (for setpoints/addpoints)",
+    points="Points to set/add (for setpoints/addpoints)"
 )
-
-@admin_group.command(name="backup", description="Backup all data to JSON")
-async def backup_command(interaction: discord.Interaction):
+@app_commands.choices(action=[
+    app_commands.Choice(name="📦 Backup Database", value="backup"),
+    app_commands.Choice(name="🎯 Set Points", value="setpoints"),
+    app_commands.Choice(name="➕ Add Points", value="addpoints"),
+    app_commands.Choice(name="🔧 Fix Database", value="fixdb"),
+    app_commands.Choice(name="⚽ Force Fetch Matches", value="forcefetch"),
+    app_commands.Choice(name="📊 Backfill Scores", value="backfillscores"),
+    app_commands.Choice(name="✅ Check Database", value="checkdb"),
+    app_commands.Choice(name="🔄 Repost Matches", value="repostmatches"),
+])
+async def admin_command(
+    interaction: discord.Interaction,
+    action: app_commands.Choice[str],
+    user: discord.Member = None,
+    points: int = None
+):
+    """Unified admin command with action parameter"""
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("❌ Admin only", ephemeral=True)
         return
     
-    with db_connection() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT user_id, username, points FROM users")
-        users = cur.fetchall()
-        cur.execute("SELECT user_id, match_id, prediction FROM predictions")
-        predictions = cur.fetchall()
+    action_value = action.value
     
-    backup_data = {
-        "users": [dict(u) for u in users],
-        "predictions": [dict(p) for p in predictions],
-        "backup_time": datetime.now(timezone.utc).isoformat()
-    }
-    
-    file_content = json.dumps(backup_data, indent=2)
-    file = discord.File(StringIO(file_content), filename=f"backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
-    
-    await interaction.response.send_message("📦 Database backup:", file=file, ephemeral=True)
-
-@admin_group.command(name="setpoints", description="Set user points")
-async def setpoints_command(interaction: discord.Interaction, user: discord.Member, points: int):
-    if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("❌ Admin only", ephemeral=True)
-        return
-    
-    user_id = str(user.id)
-    upsert_user(user_id, user.name)
-    set_user_points(user_id, points)
-    
-    await interaction.response.send_message(f"✅ Set {user.name}'s points to {points}", ephemeral=True)
-
-@admin_group.command(name="addpoints", description="Add points to user")
-async def addpoints_command(interaction: discord.Interaction, user: discord.Member, points: int):
-    if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("❌ Admin only", ephemeral=True)
-        return
-    
-    user_id = str(user.id)
-    upsert_user(user_id, user.name)
-    add_points(user_id, points)
-    
-    current_user = get_user(user_id)
-    await interaction.response.send_message(f"✅ Added {points} points to {user.name}. New total: {current_user['points']}", ephemeral=True)
-
-@admin_group.command(name="fixdb", description="Update database schema")
-async def fixdb_command(interaction: discord.Interaction):
-    if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("❌ Admin only", ephemeral=True)
-        return
-    
-    await interaction.response.defer(ephemeral=True)
-    
-    try:
-        init_db()
-        await interaction.followup.send("✅ Database schema updated successfully!", ephemeral=True)
-    except Exception as e:
-        await interaction.followup.send(f"❌ Error: {str(e)}", ephemeral=True)
-
-@admin_group.command(name="forcefetch", description="Force fetch and post upcoming matches")
-async def forcefetch_command(interaction: discord.Interaction):
-    if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("❌ Admin only", ephemeral=True)
-        return
-    
-    await interaction.response.defer(ephemeral=True)
-    
-    upcoming = await fetch_matches(hours=48)
-    
-    if not upcoming:
-        await interaction.followup.send(f"⚠️ No matches found in next 48 hours.", ephemeral=True)
-        return
-    
-    posted_count = 0
-    for match in upcoming:
-        match_id = str(match["id"])
-        if not is_match_posted(match_id):
-            await post_match(match)
-            posted_count += 1
-            await asyncio.sleep(1)
-    
-    await interaction.followup.send(f"✅ Found {len(upcoming)} matches. Posted {posted_count} new matches.", ephemeral=True)
-
-@admin_group.command(name="backfillscores", description="Fetch and save scores for processed matches")
-async def backfillscores_command(interaction: discord.Interaction):
-    if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("❌ Admin only", ephemeral=True)
-        return
-    
-    await interaction.response.defer(ephemeral=True)
-    await interaction.followup.send("⏳ Fetching match results from API... This may take a minute.", ephemeral=True)
-    
-    results = await fetch_all_match_results()
-    updated = 0
-    
-    for match_id, result_data in results.items():
-        if result_data.get('home_score') is not None:
-            update_match_score(match_id, result_data['home_score'], 
-                             result_data['away_score'], 'FINISHED')
-            updated += 1
-    
-    await interaction.followup.send(f"✅ Updated {updated} match scores from API.", ephemeral=True)
-
-@admin_group.command(name="checkdb", description="Check database status")
-async def checkdb_command(interaction: discord.Interaction):
-    if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("❌ Admin only", ephemeral=True)
-        return
-    
-    with db_connection() as conn:
-        cur = conn.cursor()
+    # BACKUP
+    if action_value == "backup":
+        with db_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT user_id, username, points FROM users")
+            users = cur.fetchall()
+            cur.execute("SELECT user_id, match_id, prediction FROM predictions")
+            predictions = cur.fetchall()
         
-        cur.execute("SELECT COUNT(*) as count FROM posted_matches WHERE home_score IS NOT NULL")
-        finished = cur.fetchone()['count']
+        backup_data = {
+            "users": [dict(u) for u in users],
+            "predictions": [dict(p) for p in predictions],
+            "backup_time": datetime.now(timezone.utc).isoformat()
+        }
         
-        cur.execute("SELECT COUNT(*) as count FROM posted_matches")
-        total = cur.fetchone()['count']
+        file_content = json.dumps(backup_data, indent=2)
+        file = discord.File(StringIO(file_content), filename=f"backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
+        await interaction.response.send_message("📦 Database backup:", file=file, ephemeral=True)
+    
+    # SET POINTS
+    elif action_value == "setpoints":
+        if not user or points is None:
+            await interaction.response.send_message("❌ Please provide both user and points parameters", ephemeral=True)
+            return
         
-        cur.execute("SELECT COUNT(*) as count FROM processed_matches")
-        processed = cur.fetchone()['count']
+        user_id = str(user.id)
+        upsert_user(user_id, user.name)
+        set_user_points(user_id, points)
+        await interaction.response.send_message(f"✅ Set {user.name}'s points to {points}", ephemeral=True)
+    
+    # ADD POINTS
+    elif action_value == "addpoints":
+        if not user or points is None:
+            await interaction.response.send_message("❌ Please provide both user and points parameters", ephemeral=True)
+            return
         
-        cur.execute("SELECT COUNT(*) as count FROM predictions")
-        total_preds = cur.fetchone()['count']
+        user_id = str(user.id)
+        upsert_user(user_id, user.name)
+        add_points(user_id, points)
+        current_user = get_user(user_id)
+        await interaction.response.send_message(f"✅ Added {points} points to {user.name}. New total: {current_user['points']}", ephemeral=True)
+    
+    # FIX DATABASE
+    elif action_value == "fixdb":
+        await interaction.response.defer(ephemeral=True)
+        try:
+            init_db()
+            await interaction.followup.send("✅ Database schema updated successfully!", ephemeral=True)
+        except Exception as e:
+            await interaction.followup.send(f"❌ Error: {str(e)}", ephemeral=True)
+    
+    # FORCE FETCH
+    elif action_value == "forcefetch":
+        await interaction.response.defer(ephemeral=True)
+        upcoming = await fetch_matches(hours=48)
         
-        await interaction.response.send_message(
-            f"**📊 Database Status:**\n"
-            f"Total matches posted: {total}\n"
-            f"Matches with scores: {finished}\n"
-            f"Processed matches: {processed}\n"
-            f"Total predictions: {total_preds}",
-            ephemeral=True
-        )
-
-@admin_group.command(name="repostmatches", description="Repost all upcoming matches")
-async def repostmatches_command(interaction: discord.Interaction):
-    if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("❌ Admin only", ephemeral=True)
-        return
-    
-    await interaction.response.defer(ephemeral=True)
-    
-    now = datetime.now(timezone.utc)
-    
-    with db_connection() as conn:
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT match_id, home_team, away_team, match_time, competition
-            FROM posted_matches
-            WHERE match_time > %s AND status != 'FINISHED'
-            ORDER BY match_time ASC
-        """, (now,))
-        matches = cur.fetchall()
-    
-    if not matches:
-        await interaction.followup.send("⚠️ No upcoming matches found in database.", ephemeral=True)
-        return
-    
-    await interaction.followup.send("⏳ Fetching match details from API...", ephemeral=True)
-    
-    api_matches = {}
-    async with aiohttp.ClientSession() as session:
-        for comp in COMPETITIONS:
-            url = f"{BASE_URL}{comp}/matches"
-            try:
-                async with session.get(url, headers=HEADERS, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        for m in data.get("matches", []):
-                            api_matches[str(m["id"])] = m
-                    await asyncio.sleep(1)
-            except Exception as e:
-                logger.error(f"Error fetching {comp}: {e}")
-    
-    channel = bot.get_channel(MATCH_CHANNEL_ID)
-    if not channel:
-        await interaction.followup.send("❌ Match channel not found!", ephemeral=True)
-        return
-    
-    matches_by_comp = {}
-    for match in matches:
-        comp = match['competition'] or 'Unknown'
-        if comp not in matches_by_comp:
-            matches_by_comp[comp] = []
-        matches_by_comp[comp].append(match)
-    
-    reposted = 0
-    
-    for competition, comp_matches in matches_by_comp.items():
-        comp_info = {"flag": "🌍", "country": "International"}
-        for code, info in COMPETITION_INFO.items():
-            if info['name'] in competition:
-                comp_info = info
-                break
+        if not upcoming:
+            await interaction.followup.send(f"⚠️ No matches found in next 48 hours.", ephemeral=True)
+            return
         
-        separator_embed = discord.Embed(
-            title=f"{comp_info['flag']} {competition}",
-            description=f"**{len(comp_matches)}** upcoming match{'es' if len(comp_matches) != 1 else ''}",
-            color=discord.Color.dark_grey()
-        )
-        separator_embed.set_footer(text="─" * 50)
+        posted_count = 0
+        for match in upcoming:
+            match_id = str(match["id"])
+            if not is_match_posted(match_id):
+                await post_match(match)
+                posted_count += 1
+                await asyncio.sleep(1)
         
-        await channel.send(embed=separator_embed)
-        await asyncio.sleep(0.5)
+        await interaction.followup.send(f"✅ Found {len(upcoming)} matches. Posted {posted_count} new matches.", ephemeral=True)
+    
+    # BACKFILL SCORES
+    elif action_value == "backfillscores":
+        await interaction.response.defer(ephemeral=True)
+        await interaction.followup.send("⏳ Fetching match results from API... This may take a minute.", ephemeral=True)
         
-        for match in comp_matches:
-            match_id = match['match_id']
-            match_time = match['match_time']
-            if match_time.tzinfo is None:
-                match_time = match_time.replace(tzinfo=timezone.utc)
+        results = await fetch_all_match_results()
+        updated = 0
+        
+        for match_id, result_data in results.items():
+            if result_data.get('home_score') is not None:
+                update_match_score(match_id, result_data['home_score'], result_data['away_score'], 'FINISHED')
+                updated += 1
+        
+        await interaction.followup.send(f"✅ Updated {updated} match scores from API.", ephemeral=True)
+    
+    # CHECK DATABASE
+    elif action_value == "checkdb":
+        with db_connection() as conn:
+            cur = conn.cursor()
             
-            kickoff_ts = int(match_time.timestamp())
-            home_team = match['home_team']
-            away_team = match['away_team']
-            competition = match['competition'] or 'Unknown'
+            cur.execute("SELECT COUNT(*) as count FROM posted_matches WHERE home_score IS NOT NULL")
+            finished = cur.fetchone()['count']
             
-            time_until = match_time - now
-            days = time_until.days
-            hours = time_until.seconds // 3600
+            cur.execute("SELECT COUNT(*) as count FROM posted_matches")
+            total = cur.fetchone()['count']
             
-            if days > 0:
-                countdown = f"⏰ in {days} day{'s' if days != 1 else ''}"
-            elif hours > 0:
-                countdown = f"⏰ in ~{hours + (days * 24)} hours"
-            else:
-                mins = time_until.seconds // 60
-                countdown = f"⏰ in {mins} minutes"
+            cur.execute("SELECT COUNT(*) as count FROM processed_matches")
+            processed = cur.fetchone()['count']
             
+            cur.execute("SELECT COUNT(*) as count FROM predictions")
+            total_preds = cur.fetchone()['count']
+            
+            await interaction.response.send_message(
+                f"**📊 Database Status:**\n"
+                f"Total matches posted: {total}\n"
+                f"Matches with scores: {finished}\n"
+                f"Processed matches: {processed}\n"
+                f"Total predictions: {total_preds}",
+                ephemeral=True
+            )
+    
+    # REPOST MATCHES
+    elif action_value == "repostmatches":
+        await interaction.response.defer(ephemeral=True)
+        
+        now = datetime.now(timezone.utc)
+        
+        with db_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT match_id, home_team, away_team, match_time, competition
+                FROM posted_matches
+                WHERE match_time > %s AND status != 'FINISHED'
+                ORDER BY match_time ASC
+            """, (now,))
+            matches = cur.fetchall()
+        
+        if not matches:
+            await interaction.followup.send("⚠️ No upcoming matches found in database.", ephemeral=True)
+            return
+        
+        await interaction.followup.send("⏳ Fetching match details from API...", ephemeral=True)
+        
+        api_matches = {}
+        async with aiohttp.ClientSession() as session:
+            for comp in COMPETITIONS:
+                url = f"{BASE_URL}{comp}/matches"
+                try:
+                    async with session.get(url, headers=HEADERS, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            for m in data.get("matches", []):
+                                api_matches[str(m["id"])] = m
+                        await asyncio.sleep(1)
+                except Exception as e:
+                    logger.error(f"Error fetching {comp}: {e}")
+        
+        channel = bot.get_channel(MATCH_CHANNEL_ID)
+        if not channel:
+            await interaction.followup.send("❌ Match channel not found!", ephemeral=True)
+            return
+        
+        matches_by_comp = {}
+        for match in matches:
+            comp = match['competition'] or 'Unknown'
+            if comp not in matches_by_comp:
+                matches_by_comp[comp] = []
+            matches_by_comp[comp].append(match)
+        
+        reposted = 0
+        
+        for competition, comp_matches in matches_by_comp.items():
             comp_info = {"flag": "🌍", "country": "International"}
             for code, info in COMPETITION_INFO.items():
                 if info['name'] in competition:
                     comp_info = info
                     break
             
-            embed = discord.Embed(
-                title=f"⚽ {home_team} vs {away_team}",
-                description=f"{comp_info['flag']} **{competition}**\n"
-                            f"🕐 Kickoff: <t:{kickoff_ts}:f>\n"
-                            f"{countdown}",
-                color=discord.Color.blue()
+            separator_embed = discord.Embed(
+                title=f"{comp_info['flag']} {competition}",
+                description=f"**{len(comp_matches)}** upcoming match{'es' if len(comp_matches) != 1 else ''}",
+                color=discord.Color.dark_grey()
             )
+            separator_embed.set_footer(text="─" * 50)
             
-            embed.add_field(name="📊 Status", value="🟢 Upcoming", inline=True)
-            embed.add_field(name="🎯 Points", value="+1 for correct prediction", inline=True)
+            await channel.send(embed=separator_embed)
+            await asyncio.sleep(0.5)
             
-            voting_closes = match_time - timedelta(minutes=10)
-            voting_closes_ts = int(voting_closes.timestamp())
-            embed.add_field(name="🗳️ Voting", value=f"Closes <t:{voting_closes_ts}:R>", inline=True)
-            
-            time_to_vote = voting_closes - now
-            hours_to_vote = int(time_to_vote.total_seconds() // 3600)
-            embed.set_footer(text=f"⏳ Voting closes 10 minutes before kickoff • You have ~{hours_to_vote} hours to vote!")
-            
-            file = None
-            api_match = api_matches.get(match_id)
-            if api_match:
-                home_crest = api_match["homeTeam"].get("crest")
-                away_crest = api_match["awayTeam"].get("crest")
-                comp_emblem = api_match['competition'].get('emblem')
+            for match in comp_matches:
+                match_id = match['match_id']
+                match_time = match['match_time']
+                if match_time.tzinfo is None:
+                    match_time = match_time.replace(tzinfo=timezone.utc)
                 
-                if comp_emblem:
-                    embed.set_thumbnail(url=comp_emblem)
+                kickoff_ts = int(match_time.timestamp())
+                home_team = match['home_team']
+                away_team = match['away_team']
+                competition = match['competition'] or 'Unknown'
                 
-                if home_crest or away_crest:
-                    try:
-                        image_buffer = await generate_match_image(home_crest, away_crest)
-                        file = discord.File(fp=image_buffer, filename="match.png")
-                        embed.set_image(url="attachment://match.png")
-                    except Exception as e:
-                        logger.error(f"Failed to generate match image for {match_id}: {e}")
-            
-            view = PersistentVoteView(match_id)
-            
-            try:
-                match_message = await channel.send(embed=embed, file=file, view=view)
-                save_vote_message(match_id, match_message.id)
+                time_until = match_time - now
+                days = time_until.days
+                hours = time_until.seconds // 3600
                 
-                live_embed = create_live_predictions_embed(match_id, home_team, away_team)
-                live_message = await channel.send(embed=live_embed)
-                save_live_predictions_message(match_id, live_message.id)
+                if days > 0:
+                    countdown = f"⏰ in {days} day{'s' if days != 1 else ''}"
+                elif hours > 0:
+                    countdown = f"⏰ in ~{hours + (days * 24)} hours"
+                else:
+                    mins = time_until.seconds // 60
+                    countdown = f"⏰ in {mins} minutes"
                 
-                separator_line = discord.Embed(description="───────────────────────────────", color=discord.Color.dark_gray())
-                await channel.send(embed=separator_line)
+                comp_info = {"flag": "🌍", "country": "International"}
+                for code, info in COMPETITION_INFO.items():
+                    if info['name'] in competition:
+                        comp_info = info
+                        break
                 
-                reposted += 1
-                await asyncio.sleep(1)
-            except Exception as e:
-                logger.error(f"Failed to repost match {match_id}: {e}")
-    
-    await interaction.followup.send(f"✅ Reposted {reposted} upcoming matches with crests.", ephemeral=True)
-
-# Add admin group to bot
-bot.tree.add_command(admin_group)
+                embed = discord.Embed(
+                    title=f"⚽ {home_team} vs {away_team}",
+                    description=f"{comp_info['flag']} **{competition}**\n"
+                                f"🕐 Kickoff: <t:{kickoff_ts}:f>\n"
+                                f"{countdown}",
+                    color=discord.Color.blue()
+                )
+                
+                embed.add_field(name="📊 Status", value="🟢 Upcoming", inline=True)
+                embed.add_field(name="🎯 Points", value="+1 for correct prediction", inline=True)
+                
+                voting_closes = match_time - timedelta(minutes=10)
+                voting_closes_ts = int(voting_closes.timestamp())
+                embed.add_field(name="🗳️ Voting", value=f"Closes <t:{voting_closes_ts}:R>", inline=True)
+                
+                time_to_vote = voting_closes - now
+                hours_to_vote = int(time_to_vote.total_seconds() // 3600)
+                embed.set_footer(text=f"⏳ Voting closes 10 minutes before kickoff • You have ~{hours_to_vote} hours to vote!")
+                
+                file = None
+                api_match = api_matches.get(match_id)
+                if api_match:
+                    home_crest = api_match["homeTeam"].get("crest")
+                    away_crest = api_match["awayTeam"].get("crest")
+                    comp_emblem = api_match['competition'].get('emblem')
+                    
+                    if comp_emblem:
+                        embed.set_thumbnail(url=comp_emblem)
+                    
+                    if home_crest or away_crest:
+                        try:
+                            image_buffer = await generate_match_image(home_crest, away_crest)
+                            file = discord.File(fp=image_buffer, filename="match.png")
+                            embed.set_image(url="attachment://match.png")
+                        except Exception as e:
+                            logger.error(f"Failed to generate match image for {match_id}: {e}")
+                
+                view = PersistentVoteView(match_id)
+                
+                try:
+                    match_message = await channel.send(embed=embed, file=file, view=view)
+                    save_vote_message(match_id, match_message.id)
+                    
+                    live_embed = create_live_predictions_embed(match_id, home_team, away_team)
+                    live_message = await channel.send(embed=live_embed)
+                    save_live_predictions_message(match_id, live_message.id)
+                    
+                    separator_line = discord.Embed(description="───────────────────────────────", color=discord.Color.dark_gray())
+                    await channel.send(embed=separator_line)
+                    
+                    reposted += 1
+                    await asyncio.sleep(1)
+                except Exception as e:
+                    logger.error(f"Failed to repost match {match_id}: {e}")
+        
+        await interaction.followup.send(f"✅ Reposted {reposted} upcoming matches with crests.", ephemeral=True)
 
 # ==== USER COMMANDS ====
 @bot.tree.command(name="matches", description="Show upcoming matches")
