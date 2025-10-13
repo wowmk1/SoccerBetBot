@@ -1295,7 +1295,11 @@ async def before_weekly_recap():
     await bot.wait_until_ready()
 
 # ==== ADMIN COMMAND GROUP ====
-admin_group = app_commands.Group(name="admin", description="Admin commands")
+admin_group = app_commands.Group(
+    name="admin", 
+    description="Admin commands",
+    default_permissions=discord.Permissions(administrator=True)
+)
 
 @admin_group.command(name="backup", description="Backup all data to JSON")
 async def backup_command(interaction: discord.Interaction):
