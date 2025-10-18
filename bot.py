@@ -2127,7 +2127,7 @@ async def daily_fetch_matches():
     except Exception as e:
         logger.error(f"Error in daily_fetch_matches: {e}", exc_info=True)
 
-scheduler.add_job(lambda: bot.loop.create_task(daily_fetch_matches()), "cron", hour=6, minute=0)
+scheduler.add_job(lambda: bot.loop.create_task(daily_fetch_matches()), "cron", hour="6,18", minute=0)
 
 # ==== STARTUP ====
 @bot.event
@@ -2185,3 +2185,4 @@ if __name__ == "__main__":
         bot.run(DISCORD_BOT_TOKEN)
     except Exception as e:
         logger.error(f"Failed to start bot: {e}", exc_info=True)
+
